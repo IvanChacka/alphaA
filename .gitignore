@@ -12,3 +12,4 @@ code/BackTest/output/
 
 # 本机完整因子文件超过GitHub单文件限制，仓库仅保留数据接口说明。
 BackTestData/factordata.parquet
+BackTestData/twap.parquet
