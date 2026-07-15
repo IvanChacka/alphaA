@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>滚动模型实时控制台</title>
+  <script src="/plotly.min.js"></script>
+  <style>
+    :root{--bg:#08111f;--panel:#111d31;--line:#263955;--text:#e8eef8;--muted:#91a5c4;--blue:#4aa8ff;--green:#42d59d;--red:#ff6677}
+    *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px system-ui,"Microsoft YaHei"}
+    header{padding:18px 26px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between}
+    .controls{display:grid;grid-template-columns:120px 120px 1fr 1.8fr 220px 230px;gap:14px;padding:16px 26px}
+    .panel,.model-panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:15px}.overview{margin:0 26px 16px}
+    .models{display:flex;gap:10px;flex-wrap:wrap;align-items:center}label{display:block;color:var(--muted);margin-bottom:6px}.models label{color:var(--text);margin:0}
+    input,select,button{background:#0c1728;color:var(--text);border:1px solid var(--line);border-radius:7px;padding:9px}select{width:100%}button{font-weight:700;cursor:pointer}.start{background:#176ba9}.stop{background:#8c2938}.secondary{padding:5px 8px}.upload-status{display:block;color:var(--muted);font-size:12px;line-height:1.4;margin-top:7px}.upload-status.ready{color:var(--green)}.upload-status.error{color:var(--red)}
+    progress{width:100%;height:14px}.badge{padding:5px 10px;border-radius:99px;background:#1c2c45}.model-panels{display:grid;grid-template-columns:1fr;gap:18px;padding:0 26px}
+    .model-head{display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--line);padding-bottom:10px}.charts{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}.chart{height:310px}
+    .metric-grid{display:flex;flex-wrap:wrap;gap:9px;margin:12px 0}.metric{background:#0a1526;border:1px solid var(--line);padding:9px 12px;border-radius:8px;min-width:145px}.metric b{display:block;color:var(--muted);font-size:12px;margin-bottom:4px}
+    .logs{margin:18px 26px}pre{height:260px;overflow:auto;white-space:pre-wrap;background:#07101d;padding:12px;border-radius:8px;color:#bdcbe0}
+    dialog{width:min(720px,calc(100vw - 32px));background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:14px;padding:0}dialog::backdrop{background:#020812cc}
+    .modal-head,.modal-actions{display:flex;align-items:center;justify-content:space-between;padding:16px 20px;border-bottom:1px solid var(--line)}.modal-actions{border:0;border-top:1px solid var(--line);justify-content:flex-end;gap:10px}
+    .param-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;padding:20px}.param-grid label{margin:0}.param-grid input{display:block;width:100%;margin-top:6px}.param-help{display:block;color:var(--muted);font-size:12px;line-height:1.45;margin-top:6px}.hint{padding:0 20px 16px;color:var(--muted);line-height:1.6}
+    @media(max-width:1000px){.controls,.charts,.param-grid{grid-template-columns:1fr}.model-panels{padding:0 12px}.overview,.logs{margin-left:12px;margin-right:12px}}
+  </style>
+</head>
+<body>
+<header><div><h2 style="margin:0">滚动模型实时控制台</h2><div style="color:var(--muted);margin-top:4px">模型顺序运行；已完成面板、指标和曲线会保留</div></div><span id="state" class="badge">idle</span></header>
+<section class="controls">
+  <div><label for="year">测试年份</label><input id="year" type="number" value="2024"></div>
+  <div><label for="trials">Optuna Trial</label><input id="trials" type="number" value="30" min="1"></div>
+  <div><label>市场/票池</label><div class="models"><label><input type="checkbox" name="pool" value="A500" checked>A500</label><label><input type="checkbox" name="pool" value="ZZ1000" checked>ZZ1000</label><label><input type="checkbox" name="pool" value="ALL_A500">all_A500</label><label><input type="checkbox" name="pool" value="ALL_ZZ1000">all_ZZ1000</label></div></div>
+  <div><label>模型执行顺序</label><div class="models">
+    <label><input type="checkbox" name="model" value="linear_regression" checked>Linear</label><label><input type="checkbox" name="model" value="ridge" checked>Ridge</label><label><input type="checkbox" name="model" value="elasticnet" checked>ElasticNet</label><label><input type="checkbox" name="model" value="xgboost" checked>XGBoost</label>
+    <label><input id="styleModel" type="checkbox" name="model" value="style_rotation">PCA风格轮动</label><button id="styleSettings" class="secondary" type="button">参数设置</button>
+  </div></div>
+  <div><label for="optimizer">分数优化器</label><select id="optimizer"><option value="none">不使用优化器</option><option value="industry_neutral">行业中性化</option></select><input id="industryFile" type="file" accept=".csv,.parquet" hidden><button class="secondary" type="button" style="margin-top:7px" onclick="$('industryFile').click()">上传行业分类</button><span id="industryStatus" class="upload-status">正在检查行业文件…</span></div>
+  <div><label>操作</label><button class="start" onclick="startJob()">开始完整任务</button> <button class="stop" onclick="stopJob()">终止</button></div>
+</section>
+<section class="panel overview"><div id="message" style="color:var(--blue)">等待启动</div><progress id="progress" max="1" value="0"></progress><div id="queue" style="margin-top:8px;color:var(--muted)"></div><div style="margin-top:8px;color:var(--muted)">行业中性化约束作用于所选票池内的预测分数；不改变既有回测的等权、换手、涨跌停、ST和停牌规则。</div></section>
+<main id="modelPanels" class="model-panels"></main>
+<section class="panel logs"><h3>当前任务实时日志</h3><pre id="logs"></pre></section>
+
+<dialog id="styleModal" aria-labelledby="styleModalTitle">
+  <div class="modal-head"><div><h2 id="styleModalTitle" style="margin:0">PCA风格轮动参数</h2><small style="color:var(--muted)">参数随本次任务写入运行清单</small></div><button type="button" id="styleClose" aria-label="关闭">×</button></div>
+  <div class="param-grid">
+    <label>PCA累计解释率<input id="cfgPcaVariance" type="number" min="0.5" max="0.999" step="0.01" value="0.90"><span class="param-help">累计解释率目标；越高会保留更多风格成分、缩小残差空间并增加计算量。</span></label>
+    <label>PCA最少成分数<input id="cfgPcaMin" type="number" min="1" step="1" value="5"><span class="param-help">PCA成分数下限；实际成分数仍会继续增加，直到达到累计解释率目标。</span></label>
+    <label>买入确认风格数<input id="cfgBuy" type="number" min="1" step="1" value="1"><span class="param-help">股票至少获得几个明确看多风格才可买入；1表示任意风格看多即可入选。</span></label>
+    <label>卖出确认风格数<input id="cfgSell" type="number" min="1" step="1" value="2"><span class="param-help">至少几个风格共同看空才允许卖出；数值越高越偏向惰性持有、换手越低。</span></label>
+    <label>看多/看空筛选分位<input id="cfgVoteQuantile" type="number" min="0.51" max="0.99" step="0.01" value="0.90"><span class="param-help">0.90表示每个风格仅最强10%看多、最弱10%看空；越高覆盖越低，必须用2022—2023验证确定，不能按2024结果反调。</span></label>
+    <label>正交残差增量权重<input id="cfgResidualWeight" type="number" min="0" max="10" step="0.1" value="1.0"><span class="param-help">控制正交残差预测加入最终分数的比例；0关闭残差，1表示与标准化风格分数等权相加。</span></label>
+    <label>残差Ridge alpha<input id="cfgResidualAlpha" type="number" min="0.000001" step="any" value="0.05"><span class="param-help">L2正则强度而不是IC目标；越大系数收缩越强，过大可能欠拟合，过小可能放大残差噪声。</span></label>
+    <label>滚动ICIR窗口（日）<input id="cfgIcirWindow" type="number" min="10" max="1000" step="1" value="60"><span class="param-help">只用过去已实现IC计算5日/20日模型动态权重；短窗口更灵敏也更噪，长窗口更稳定但更滞后。</span></label>
+  </div>
+  <div class="hint">参数选择边界：2020—2021固定PCA，2022—2023用于参数验证，2024只做最终样本外检验。风格XGB跨风格验证IC、股票横截面IC和累计IC是不同口径，报告会分别展示。</div>
+  <div class="modal-actions"><button type="button" id="styleCancel">取消</button><button type="button" class="start" id="styleSave">保存参数</button></div>
+</dialog>
+
+<script>
+const $=id=>document.getElementById(id),dark={paper_bgcolor:'#111d31',plot_bgcolor:'#111d31',font:{color:'#cbd7ea'},margin:{l:45,r:20,t:25,b:40},xaxis:{gridcolor:'#263955'},yaxis:{gridcolor:'#263955'}};
+const selected=n=>[...document.querySelectorAll(`input[name=${n}]:checked`)].map(x=>x.value),safe=x=>x.replace(/[^a-z0-9_]/gi,'_');
+let styleConfig={pca_variance:.90,pca_min_components:5,buy_confirmations:1,sell_confirmations:2,vote_quantile:.90,residual_weight:1,residual_alpha:.05,icir_window:60};
+let industryReady=false;
+function openStyle(){ $('cfgPcaVariance').value=styleConfig.pca_variance;$('cfgPcaMin').value=styleConfig.pca_min_components;$('cfgBuy').value=styleConfig.buy_confirmations;$('cfgSell').value=styleConfig.sell_confirmations;$('cfgVoteQuantile').value=styleConfig.vote_quantile;$('cfgResidualWeight').value=styleConfig.residual_weight;$('cfgResidualAlpha').value=styleConfig.residual_alpha;$('cfgIcirWindow').value=styleConfig.icir_window;$('styleModal').showModal() }
+function saveStyle(){styleConfig={pca_variance:+$('cfgPcaVariance').value,pca_min_components:+$('cfgPcaMin').value,buy_confirmations:+$('cfgBuy').value,sell_confirmations:+$('cfgSell').value,vote_quantile:+$('cfgVoteQuantile').value,residual_weight:+$('cfgResidualWeight').value,residual_alpha:+$('cfgResidualAlpha').value,icir_window:+$('cfgIcirWindow').value};if(![...$('styleModal').querySelectorAll('input')].every(x=>x.reportValidity()))return;$('styleModal').close()}
+$('styleModel').addEventListener('change',e=>{if(e.target.checked)openStyle()});$('styleSettings').onclick=openStyle;$('styleSave').onclick=saveStyle;$('styleCancel').onclick=$('styleClose').onclick=()=>$('styleModal').close();
+async function refreshOptimizerInfo(){try{const j=await(await fetch('/api/optimizer-info')).json();industryReady=!!j.industry_ready;const node=$('industryStatus');node.className='upload-status '+(industryReady?'ready':j.error?'error':'');node.textContent=industryReady?`已就绪：${j.industry_symbols}只股票，${j.industry_dated?'时点分类':'静态分类'}`:(j.error||'未上传industry.csv/parquet');}catch(e){industryReady=false;$('industryStatus').className='upload-status error';$('industryStatus').textContent='检查失败：'+e.message}}
+async function uploadIndustry(){const file=$('industryFile').files[0];if(!file)return;const node=$('industryStatus');node.className='upload-status';node.textContent='正在上传并校验…';try{const response=await fetch('/api/industry-upload?filename='+encodeURIComponent(file.name),{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:file});const j=await response.json();if(j.error)throw new Error(j.error);await refreshOptimizerInfo()}catch(e){industryReady=false;node.className='upload-status error';node.textContent='上传失败：'+e.message}finally{$('industryFile').value=''}}
+$('industryFile').addEventListener('change',uploadIndustry);
+async function startJob(){if($('optimizer').value==='industry_neutral'&&!industryReady){alert('请先上传并通过校验的行业分类文件');return}const body={test_year:+$('year').value,optuna_trials:+$('trials').value,models:selected('model'),pools:selected('pool'),optimizer:$('optimizer').value,style_config:styleConfig};const j=await(await fetch('/api/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();if(j.error)alert(j.error)}
+async function stopJob(){$('message').textContent='正在终止模型进程…';const j=await(await fetch('/api/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})).json();if(j.error)$('message').textContent='终止失败：'+j.error;else await update()}
+function draw(id,traces){Plotly.react(id,traces,dark,{responsive:true,displaylogo:false})}
+function panel(model){const id=safe(model);let node=$('panel_'+id);if(node)return node;node=document.createElement('section');node.id='panel_'+id;node.className='model-panel';node.innerHTML=`<div class="model-head"><h2>${model}</h2><span id="status_${id}" class="badge">等待</span></div><div id="message_${id}" style="color:var(--muted);margin-top:8px"></div><div id="metrics_${id}" class="metric-grid"></div><div class="charts"><div><h3>拟合/调参曲线</h3><div id="fit_${id}" class="chart"></div></div><div><h3>样本外IC</h3><div id="ic_${id}" class="chart"></div></div><div><h3>回测收益曲线</h3><div id="nav_${id}" class="chart"></div></div></div><div id="path_${id}" style="color:var(--muted)"></div>`;$('modelPanels').appendChild(node);return node}
+const pct=v=>v==null||!isFinite(v)?'-':(v*100).toFixed(2)+'%',num=v=>v==null||!isFinite(v)?'-':Number(v).toFixed(3);
+function renderModel(model,r,current,completed){
+  panel(model);const id=safe(model),live=r.live||{},tr=r.training||[],ot=r.trials||[],ic=r.daily_ic||[],ci=r.component_ic||[],rows=r.backtest_metrics||[],backtests=r.backtests||{};
+  $('status_'+id).textContent=completed?'已完成':current?'运行中':'等待';$('message_'+id).textContent=live.message||'';
+  const fields=[];for(const m of rows){const p=m.pool||'票池';fields.push([p+' 年化收益',pct(m.absolute_annual_return)],[p+' 夏普',num(m.absolute_sharpe)],[p+' 最大回撤',pct(m.absolute_max_drawdown)],[p+' 超额年化',pct(m.excess_annual_return)],[p+' 超额夏普',num(m.excess_sharpe)],[p+' 换手率',num(m.turnover)],[p+' 票池RankIC',num(m.pool_mean_rank_ic)],[p+' 票池ICIR',num(m.pool_icir)],[p+' IC样本覆盖',pct(m.pool_signal_coverage)],[p+' IC日均股票数',num(m.pool_ic_average_stock_count)],[p+' 交易费',m.total_fees==null?'-':Number(m.total_fees).toLocaleString()]);}
+  $('metrics_'+id).innerHTML=fields.map(x=>`<div class="metric"><b>${x[0]}</b>${x[1]}</div>`).join('');
+  const isStyle=tr.some(x=>x.oos_style_rank_ic_5!=null||x.oos_style_rank_ic_20!=null);
+  const fitTraces=isStyle?[
+    {x:tr.map(x=>x.quarter),y:tr.map(x=>x.train_rank_ic_5),name:'5日 训练跨风格IC',mode:'lines+markers'},
+    {x:tr.length?[tr[0].quarter]:[],y:tr.length?[tr[0].validation_rank_ic_5]:[],name:'5日 固定20日隔离验证IC（单点）',mode:'markers',marker:{size:11}},
+    {x:tr.map(x=>x.quarter),y:tr.map(x=>x.oos_style_rank_ic_5),name:'5日 样本外跨风格IC',mode:'lines+markers'},
+    {x:tr.map(x=>x.quarter),y:tr.map(x=>x.train_rank_ic_20),name:'20日 训练跨风格IC',mode:'lines+markers'},
+    {x:tr.length?[tr[0].quarter]:[],y:tr.length?[tr[0].validation_rank_ic_20]:[],name:'20日 固定20日隔离验证IC（单点）',mode:'markers',marker:{size:11}},
+    {x:tr.map(x=>x.quarter),y:tr.map(x=>x.oos_style_rank_ic_20),name:'20日 样本外跨风格IC',mode:'lines+markers'}
+  ]:[
+    {x:tr.map(x=>x.quarter),y:tr.map(x=>x.train_rank_ic),name:'训练RankIC',mode:'lines+markers'},
+    {x:tr.map(x=>x.quarter),y:tr.map(x=>x.validation_rank_ic),name:'验证RankIC',mode:'lines+markers'},
+    {x:tr.map(x=>x.quarter),y:tr.map(x=>x.quarter_rank_ic),name:'股票样本外IC',mode:'lines+markers'},
+    {x:ot.map(x=>x.number),y:ot.map(x=>x.value),name:'Optuna验证IC',mode:'lines+markers'}
+  ];draw('fit_'+id,fitTraces);
+  const cumulative=(rows)=>rows.reduce((a,x,i)=>{a.push((a[i-1]||0)+(x.rank_ic||0));return a},[]),styleIc=ci.filter(x=>x.component==='style_timing'),residualIc=ci.filter(x=>x.component==='orthogonal_residual');
+  draw('ic_'+id,[{x:ic.map(x=>x.factor_date),y:ic.map(x=>x.rank_ic),name:'最终股票分数每日RankIC',mode:'lines'},{x:ic.map(x=>x.factor_date),y:cumulative(ic),name:'最终股票分数累计RankIC',mode:'lines'},{x:styleIc.map(x=>x.factor_date),y:cumulative(styleIc),name:'风格股票分数累计RankIC（同候选样本）',mode:'lines'},{x:residualIc.map(x=>x.factor_date),y:cumulative(residualIc),name:'正交残差累计IC（同候选样本）',mode:'lines'}]);
+  const nav=[];for(const [pool,payload] of Object.entries(backtests)){const c=payload.curve||[];nav.push({x:c.map(x=>x.date),y:c.map(x=>x.strategy),name:pool+' 策略',mode:'lines'},{x:c.map(x=>x.date),y:c.map(x=>x.benchmark),name:pool+' 基准',mode:'lines'});}draw('nav_'+id,nav);$('path_'+id).textContent=r.report?'报告：'+r.report:'运行目录：'+(r.run_dir||'')
+}
+async function update(){try{const s=await(await fetch('/api/status')).json(),live=s.live||{};$('state').textContent=s.state;$('progress').value=live.progress||0;$('message').textContent=live.message||s.error||'等待启动';$('queue').textContent=`当前：${s.current_model||'-'}　已完成：${(s.completed_models||[]).join(', ')||'-'}　队列：${(s.models||[]).join(' → ')||'-'}`;$('logs').textContent=(s.logs||[]).join('\n');$('logs').scrollTop=$('logs').scrollHeight;for(const [model,r] of Object.entries(s.model_results||{}))renderModel(model,r,model===s.current_model,(s.completed_models||[]).includes(model));setTimeout(update,s.state==='running'?1000:4000)}catch(e){$('message').textContent='连接失败：'+e.message;setTimeout(update,4000)}}
+refreshOptimizerInfo();update();
+</script>
+</body>
+</html>

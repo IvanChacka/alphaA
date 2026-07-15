@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+.codex/
+.agents/
+
+# 训练、回测和网页运行产物由本地任务生成，不进入源码仓库。
+code/Model/output/
+code/BackTest/output/
+*.log
+
+# 本机完整因子文件超过GitHub单文件限制，仓库仅保留数据接口说明。
+BackTestData/factordata.parquet

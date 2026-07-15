@@ -1,0 +1,10 @@
+pandas
+numpy
+pyarrow
+scikit-learn
+xgboost
+optuna
+plotly
+joblib
+scipy
+pytest

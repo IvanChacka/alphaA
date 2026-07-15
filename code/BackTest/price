@@ -1,0 +1,21 @@
+# ============================================================
+# 7. 价格口径
+# ============================================================
+
+@dataclass(frozen=True)
+class PriceConfig:
+    """
+    twap和closePrice均为后复权价格。
+
+    真实交易价格：
+        real_twap = adjusted_twap / accum_adj_factor
+
+    真实收盘价格：
+        real_close = adjusted_close / accum_adj_factor
+    """
+
+    twap_is_adjusted: bool = True
+    close_is_adjusted: bool = True
+
+
+PRICE_CONFIG = PriceConfig()
