@@ -49,6 +49,28 @@ def test_fixed_pca_accepts_zero_variance_missing_factor():
     assert np.allclose(model.loadings[-1], 0.0)
 
 
+def test_pca_style_rankic_reports_every_component_by_quarter():
+    dates = pd.to_datetime(["2024-01-02", "2024-01-03"])
+    symbols = ["000001", "000002", "000003"]
+    rows, labels = [], []
+    for date in dates:
+        for value, symbol in enumerate(symbols, start=1):
+            rows.append({"factor_date": date, "symbol": symbol,
+                         "style_1": float(value), "style_2": float(-value)})
+            labels.append({"factor_date": date, "symbol": symbol,
+                           "label": float(value)})
+    quarter = pd.Period("2024Q1", freq="Q")
+    daily, summary = StyleRotationPipeline._pca_style_rankic(
+        {quarter: {"exposure": pd.DataFrame(rows)}},
+        pd.DataFrame(labels), ["style_1", "style_2"])
+
+    assert set(daily["style"]) == {"style_1", "style_2"}
+    by_style = summary.set_index("style")
+    assert np.isclose(by_style.loc["style_1", "mean_rank_ic"], 1.0)
+    assert np.isclose(by_style.loc["style_2", "mean_rank_ic"], -1.0)
+    assert set(summary.quarter) == {"2024Q1"}
+
+
 def test_timing_features_only_use_realized_returns():
     dates = pd.date_range("2024-01-02", periods=12, freq="B")
     rows = []
@@ -102,9 +124,10 @@ def test_consensus_scores_keep_neutral_out_and_require_multiple_bearish_votes_to
     exposure = pd.DataFrame({"factor_date": [date] * 10, "symbol": [f"{i:06d}" for i in range(10)]})
     for i, style in enumerate(styles): exposure[style] = np.linspace(-1, 1, 10) * (1 if i < 2 else -1)
     forecast = pd.DataFrame({"decision_date": [date], **{style: [1.0] for style in styles}})
-    score, retain, votes = StyleRotationPipeline._consensus_stock_scores(exposure, forecast, styles)
+    score, votes = StyleRotationPipeline._consensus_stock_scores(exposure, forecast, styles)
     assert score.prediction.notna().sum() < len(score)
-    assert (votes.loc[retain.retain, "sell_votes"] < 2).all()
+    assert "retain" not in score
+    assert votes.sell_votes.max() >= 2
 
 
 def test_any_single_bullish_style_is_enough_to_buy():
@@ -115,7 +138,7 @@ def test_any_single_bullish_style_is_enough_to_buy():
         "style_1": [-2., -1., 0., 1., 2.], "style_2": 0., "style_3": 0.})
     forecast = pd.DataFrame({"decision_date": [date], "style_1": [1.],
                              "style_2": [0.], "style_3": [0.]})
-    score, _, votes = StyleRotationPipeline._consensus_stock_scores(
+    score, votes = StyleRotationPipeline._consensus_stock_scores(
         exposure, forecast, styles, buy_confirmations=1, vote_quantile=.80)
     assert votes.buy_eligible.sum() == 1
     assert score.loc[votes.buy_eligible, "prediction"].notna().all()
@@ -257,5 +280,16 @@ def test_negative_realized_xgb_icir_disables_both_horizons_without_future_data()
     assert result.loc[0, "model_ic_observations_20"] == 10
     assert result.loc[0, "max_ic_information_date_5"] < date
     assert result.loc[0, "max_ic_information_date_20"] < date
-    assert result.loc[0, "weight_5"] == 0
-    assert result.loc[0, "weight_20"] == 0
+    assert result.loc[0, "risk_off"]
+    assert np.isclose(result.loc[0, "weight_5"] + result.loc[0, "weight_20"], 1.0)
+
+
+def test_fixed_pca_sample_is_fitted_once_on_historical_window():
+    frame = pd.DataFrame({
+        "factor_date": pd.to_datetime(["2019-12-31", "2020-01-02", "2021-12-31",
+                                        "2022-01-04", "2024-03-29"]),
+        "symbol": ["000001"] * 5, "f0": np.arange(5, dtype=float),
+    })
+    fit = StyleRotationPipeline._fixed_pca_sample(frame)
+    assert set(fit.factor_date) == {pd.Timestamp("2020-01-02"), pd.Timestamp("2021-12-31")}
+    assert fit.factor_date.max() < pd.Timestamp("2022-01-01")

@@ -1,9 +1,11 @@
 """滚动模型实时控制台：顺序执行模型、展示进度并支持终止。"""
 from imports import *
 from urllib.parse import parse_qs
-from env import (DATA_DIR, INDUSTRY_DATA_CANDIDATES, MODEL_N_JOBS, MODEL_ROOT,
-                 OPTIMIZER_NAMES, OUTPUT_ROOT, SUPPORTED_POOLS)
-from optimizers import create_optimizer
+from env import (DATA_DIR, DRAWDOWN_LIMIT, DRAWDOWN_OPTIMIZER_NAMES,
+                 INDUSTRY_DATA_CANDIDATES, MODEL_N_JOBS, MODEL_ROOT,
+                 OPTIMIZER_NAMES, OUTPUT_ROOT, SUPPORTED_POOLS, TURNOVER_MAX_RATIO,
+                 TURNOVER_OPTIMIZER_NAMES, TURNOVER_SELL_CONFIRMATIONS)
+from optimizers import create_drawdown_optimizer, create_optimizer, create_turnover_optimizer
 from optimizers.industry_neutral import IndustryNeutralOptimizer
 
 
@@ -14,7 +16,6 @@ STYLE_CONFIG_DEFAULTS = {
     "pca_variance": 0.90,
     "pca_min_components": 5,
     "buy_confirmations": 1,
-    "sell_confirmations": 2,
     "vote_quantile": 0.90,
     "residual_weight": 1.0,
     "residual_alpha": 0.05,
@@ -24,7 +25,10 @@ STYLE_CONFIG_DEFAULTS = {
 
 def optimizer_info() -> dict[str, Any]:
     existing = next((Path(path) for path in INDUSTRY_DATA_CANDIDATES if Path(path).exists()), None)
-    payload = {"optimizers": OPTIMIZER_NAMES, "industry_file": str(existing) if existing else "",
+    payload = {"optimizers": OPTIMIZER_NAMES,
+               "turnover_optimizers": TURNOVER_OPTIMIZER_NAMES,
+               "drawdown_optimizers": DRAWDOWN_OPTIMIZER_NAMES,
+               "industry_file": str(existing) if existing else "",
                "industry_ready": False, "industry_rows": 0, "industry_symbols": 0,
                "industry_dated": False, "error": ""}
     if existing:
@@ -71,7 +75,6 @@ def validate_style_config(raw: Any) -> dict[str, int | float]:
         "pca_variance": float(source.get("pca_variance", STYLE_CONFIG_DEFAULTS["pca_variance"])),
         "pca_min_components": int(source.get("pca_min_components", STYLE_CONFIG_DEFAULTS["pca_min_components"])),
         "buy_confirmations": int(source.get("buy_confirmations", STYLE_CONFIG_DEFAULTS["buy_confirmations"])),
-        "sell_confirmations": int(source.get("sell_confirmations", STYLE_CONFIG_DEFAULTS["sell_confirmations"])),
         "vote_quantile": float(source.get("vote_quantile", STYLE_CONFIG_DEFAULTS["vote_quantile"])),
         "residual_weight": float(source.get("residual_weight", STYLE_CONFIG_DEFAULTS["residual_weight"])),
         "residual_alpha": float(source.get("residual_alpha", STYLE_CONFIG_DEFAULTS["residual_alpha"])),
@@ -81,8 +84,8 @@ def validate_style_config(raw: Any) -> dict[str, int | float]:
         raise ValueError("PCA累计解释率必须在0.50到0.999之间")
     if not 1 <= config["pca_min_components"] <= 100:
         raise ValueError("PCA最少成分数必须在1到100之间")
-    if not 1 <= config["buy_confirmations"] <= 100 or not 1 <= config["sell_confirmations"] <= 100:
-        raise ValueError("买入/卖出确认风格数必须在1到100之间")
+    if not 1 <= config["buy_confirmations"] <= 100:
+        raise ValueError("买入确认风格数必须在1到100之间")
     if not .50 < config["vote_quantile"] < 1:
         raise ValueError("看多/看空分位必须在0.50到1之间")
     if not 0 <= config["residual_weight"] <= 10:
@@ -198,6 +201,7 @@ class TrainingJob:
                 "training": self._csv(run_dir / "metrics/training_records.csv"),
                 "daily_ic": self._csv(run_dir / "metrics/daily_rankic.csv"),
                 "component_ic": self._csv(run_dir / "metrics/score_component_rankic.csv"),
+                "pca_style_ic": self._csv(run_dir / "metrics/pca_style_rankic.csv"),
                 "trials": self._csv(trial_files[-1]) if trial_files else [],
                 "tuning": self._csv(tuning_files[-1]) if tuning_files else [],
                 "backtest": backtest_live,
@@ -227,6 +231,20 @@ class TrainingJob:
             if optimizer != "none" and not config.get("skip_backtest"):
                 create_optimizer(optimizer)
             config["optimizer"] = optimizer
+            turnover_optimizer = str(config.get("turnover_optimizer", "none"))
+            drawdown_optimizer = str(config.get("drawdown_optimizer", "none"))
+            sell_confirmations = int(config.get("sell_confirmations", TURNOVER_SELL_CONFIRMATIONS))
+            max_turnover_ratio = float(config.get("max_turnover_ratio", TURNOVER_MAX_RATIO))
+            max_drawdown_limit = float(config.get("max_drawdown_limit", DRAWDOWN_LIMIT))
+            create_turnover_optimizer(turnover_optimizer, sell_confirmations, max_turnover_ratio)
+            create_drawdown_optimizer(drawdown_optimizer, max_drawdown_limit)
+            if turnover_optimizer == "lazy_turnover" and set(models) != {"style_rotation"}:
+                raise ValueError("惰性持仓依赖风格投票，只能在仅选择固定PCA风格轮动时启用")
+            config.update({"turnover_optimizer": turnover_optimizer,
+                           "drawdown_optimizer": drawdown_optimizer,
+                           "sell_confirmations": sell_confirmations,
+                           "max_turnover_ratio": max_turnover_ratio,
+                           "max_drawdown_limit": max_drawdown_limit})
             self.state, self.models, self.completed_models = "running", list(models), []
             self.current_model, self.run_dirs, self.logs, self.error = None, {}, [], ""
             self.stop_event.clear()
@@ -247,7 +265,12 @@ class TrainingJob:
                            "--test-year", str(int(config.get("test_year", 2024))),
                            "--optuna-trials", str(int(config.get("optuna_trials", 30))), "--n-jobs", str(MODEL_N_JOBS),
                            "--pools", *config.get("pools", ["A500", "ZZ1000"]),
-                           "--optimizer", str(config.get("optimizer", "none"))]
+                           "--optimizer", str(config.get("optimizer", "none")),
+                           "--turnover-optimizer", str(config.get("turnover_optimizer", "none")),
+                           "--drawdown-optimizer", str(config.get("drawdown_optimizer", "none")),
+                           "--sell-confirmations", str(config.get("sell_confirmations", TURNOVER_SELL_CONFIRMATIONS)),
+                           "--max-turnover-ratio", str(config.get("max_turnover_ratio", TURNOVER_MAX_RATIO)),
+                           "--max-drawdown-limit", str(config.get("max_drawdown_limit", DRAWDOWN_LIMIT))]
                 if model != "style_rotation":
                     command.extend(["--models", model])
                 else:
@@ -258,7 +281,6 @@ class TrainingJob:
                         "--pca-variance", str(style["pca_variance"]),
                         "--pca-min-components", str(style["pca_min_components"]),
                         "--buy-confirmations", str(style["buy_confirmations"]),
-                        "--sell-confirmations", str(style["sell_confirmations"]),
                         "--vote-quantile", str(style["vote_quantile"]),
                         "--residual-weight", str(style["residual_weight"]),
                         "--residual-alpha", str(style["residual_alpha"]),

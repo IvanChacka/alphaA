@@ -13,8 +13,13 @@ def performance(account: pd.DataFrame, benchmark: pd.Series, annual_days=252, rf
     bench = benchmark / benchmark.iloc[0]
     if not np.isfinite(bench.to_numpy(dtype=float)).all():
         raise ValueError("基准净值存在非有限值")
-    ret, bret = nav.pct_change(fill_method=None).dropna(), bench.pct_change(fill_method=None).dropna()
-    excess = ret.sub(bret, fill_value=0)
+    ret = nav.pct_change(fill_method=None).dropna()
+    # Keep every excess metric on the same relative-NAV basis as the chart.
+    # Using ``strategy_return - benchmark_return`` and compounding it produces
+    # a different path from strategy_nav / benchmark_nav whenever the
+    # benchmark return is non-zero.
+    excess_nav = nav / bench
+    excess = excess_nav.pct_change(fill_method=None).dropna()
     years = max(len(ret) / annual_days, 1 / annual_days)
     calc = lambda r: {
         "annual_return": float((1 + r).prod() ** (1 / years) - 1),
@@ -24,5 +29,5 @@ def performance(account: pd.DataFrame, benchmark: pd.Series, annual_days=252, rf
     }
     metrics = {f"absolute_{k}": v for k, v in calc(ret).items()}
     metrics.update({f"excess_{k}": v for k, v in calc(excess).items()})
-    curve = pd.DataFrame({"strategy": nav, "benchmark": bench, "excess": nav / bench})
+    curve = pd.DataFrame({"strategy": nav, "benchmark": bench, "excess": excess_nav})
     return metrics, curve

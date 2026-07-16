@@ -14,6 +14,7 @@ class BacktestConfig:
     initial_cash: float = 100_000_000.0
     holding_count: int = 200
     max_turnover_ratio: float = 0.30
+    max_drawdown_limit: float | None = None
     fee_rate: float = 0.0014
     annual_days: int = 252
     risk_free_rate: float = 0.0

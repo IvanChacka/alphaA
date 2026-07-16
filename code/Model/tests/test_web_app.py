@@ -23,6 +23,13 @@ def test_all_market_options_are_supported_and_rendered():
 def test_optimizer_selector_and_industry_upload_are_rendered():
     html = (MODEL_ROOT / "web/index.html").read_text(encoding="utf-8")
     assert 'id="optimizer"' in html
+    assert 'id="turnoverOptimizer"' in html
+    assert 'value="lazy_turnover"' in html
+    assert 'id="drawdownOptimizer"' in html
+    assert 'value="quadratic_drawdown"' in html
+    assert 'id="sellConfirmations"' in html
+    assert 'id="maxTurnoverRatio"' in html
+    assert 'id="maxDrawdownLimit"' in html
     assert 'value="industry_neutral"' in html
     assert 'id="industryFile"' in html
     assert "/api/industry-upload" in html
@@ -33,6 +40,27 @@ def test_web_job_rejects_unknown_optimizer():
     job = TrainingJob()
     with pytest.raises(ValueError, match="合法优化器"):
         job.start({"models": ["ridge"], "pools": ["A500"], "optimizer": "unknown"})
+    with pytest.raises(ValueError, match="换手率优化器"):
+        job.start({"models": ["ridge"], "pools": ["A500"],
+                   "turnover_optimizer": "unknown"})
+    with pytest.raises(ValueError, match="最大回撤优化器"):
+        job.start({"models": ["ridge"], "pools": ["A500"],
+                   "drawdown_optimizer": "unknown"})
+
+
+def test_model_frontend_uses_multi_select_dropdown():
+    html = (MODEL_ROOT / "web/index.html").read_text(encoding="utf-8")
+    assert 'id="modelDropdown" class="multi-select"' in html
+    assert html.count('name="model"') == 5
+    assert 'models=selected(\'model\')' in html
+    assert 'models,pools:selected(\'pool\')' in html
+
+
+def test_lazy_turnover_rejects_mixed_model_selection():
+    job = TrainingJob()
+    with pytest.raises(ValueError, match="只能在仅选择固定PCA"):
+        job.start({"models": ["ridge", "style_rotation"], "pools": ["A500"],
+                   "turnover_optimizer": "lazy_turnover"})
 
 
 def test_industry_upload_is_validated_and_saved_atomically(tmp_path, monkeypatch):
@@ -51,7 +79,7 @@ def test_industry_upload_is_validated_and_saved_atomically(tmp_path, monkeypatch
 
 def test_style_parameter_modal_explains_every_parameter():
     html = (MODEL_ROOT / "web/index.html").read_text(encoding="utf-8")
-    assert html.count('class="param-help"') == 8
+    assert html.count('class="param-help"') == 7
     assert "L2正则强度而不是IC目标" in html
     assert "0.90表示每个风格仅最强10%看多" in html
     assert 'id="cfgResidualAlpha" type="number" min="0.000001" step="any"' in html
@@ -66,13 +94,13 @@ def test_frontend_displays_pool_icir_metrics():
 def test_style_frontend_compares_same_horizon_cross_style_ic():
     html = (MODEL_ROOT / "web/index.html").read_text(encoding="utf-8")
     assert "5日 训练跨风格IC" in html
-    assert "5日 固定20日隔离验证IC（单点）" in html
+    assert "5日 固定20日隔离验证IC（单点）" not in html
     assert "5日 样本外跨风格IC" in html
     assert "20日 训练跨风格IC" in html
-    assert "20日 固定20日隔离验证IC（单点）" in html
+    assert "20日 固定20日隔离验证IC（单点）" not in html
     assert "20日 样本外跨风格IC" in html
-    assert "tr.map(x=>x.validation_rank_ic_5)" not in html
-    assert "tr.map(x=>x.validation_rank_ic_20)" not in html
+    assert "pca_style_ic" in html
+    assert "PCA '+style+' 股票RankIC" in html
 
 
 def test_web_job_starts_idle_and_has_serial_state():

@@ -1,8 +1,10 @@
 """季度滚动机器学习总入口。"""
 from imports import *
-from env import (ACTIVE_POOLS, LINEAR_MODELS, MODEL_N_JOBS, NONLINEAR_MODELS,
-                 MLConfig, OPTIMIZER_NAMES, OPTUNA_N_TRIALS)
-from optimizers import create_optimizer
+from env import (ACTIVE_POOLS, DRAWDOWN_LIMIT, DRAWDOWN_OPTIMIZER_NAMES,
+                 LINEAR_MODELS, MODEL_N_JOBS, NONLINEAR_MODELS, MLConfig,
+                 OPTIMIZER_NAMES, OPTUNA_N_TRIALS, TURNOVER_MAX_RATIO,
+                 TURNOVER_OPTIMIZER_NAMES, TURNOVER_SELL_CONFIRMATIONS)
+from optimizers import create_drawdown_optimizer, create_optimizer, create_turnover_optimizer
 from rolling_ml.backtest_adapter import BacktestAdapter
 from rolling_ml.experiment_logger import ExperimentLogger
 from rolling_ml.report_generator import ReportGenerator
@@ -20,6 +22,11 @@ def parse_args():
     parser.add_argument("--skip-backtest", action="store_true")
     parser.add_argument("--optimizer", choices=OPTIMIZER_NAMES, default="none",
                         help="预测分数进入既有回测前使用的约束优化器")
+    parser.add_argument("--turnover-optimizer", choices=TURNOVER_OPTIMIZER_NAMES, default="none")
+    parser.add_argument("--drawdown-optimizer", choices=DRAWDOWN_OPTIMIZER_NAMES, default="none")
+    parser.add_argument("--sell-confirmations", type=int, default=TURNOVER_SELL_CONFIRMATIONS)
+    parser.add_argument("--max-turnover-ratio", type=float, default=TURNOVER_MAX_RATIO)
+    parser.add_argument("--max-drawdown-limit", type=float, default=DRAWDOWN_LIMIT)
     parser.add_argument("--resume-run", help="复用指定run目录并续跑Optuna，例如 run_20240701_120000")
     return parser.parse_args()
 
@@ -37,6 +44,9 @@ def main() -> None:
     try:
         if not args.skip_backtest:
             create_optimizer(args.optimizer)
+            create_turnover_optimizer(args.turnover_optimizer, args.sell_confirmations,
+                                      args.max_turnover_ratio)
+            create_drawdown_optimizer(args.drawdown_optimizer, args.max_drawdown_limit)
         result = RollingPredictor(cfg, logger).run_year(args.test_year)
         backtest_rows, curve_frames = [], []
         detail_frames = {"account": [], "orders": [], "trades": [], "holdings": [], "adjustments": []}
@@ -50,7 +60,12 @@ def main() -> None:
                         logger.status("backtest", .92, f"正在回测 {model_name} - {pool}", model=model_name, pool=pool)
                         bt_result, metrics, curve = adapter.run(
                             prediction, pool, logger.root / "backtest", model_name,
-                            optimizer_name=args.optimizer)
+                            optimizer_name=args.optimizer,
+                            turnover_optimizer_name=args.turnover_optimizer,
+                            drawdown_optimizer_name=args.drawdown_optimizer,
+                            sell_confirmations=args.sell_confirmations,
+                            max_turnover_ratio=args.max_turnover_ratio,
+                            max_drawdown_limit=args.max_drawdown_limit)
                         backtest_rows.append({"model": model_name, "pool": pool, **metrics})
                         curve["model"], curve["pool"] = model_name, pool
                         curve_frames.append(curve)
@@ -78,6 +93,8 @@ def main() -> None:
                                 for file in importance_files], ignore_index=True) if importance_files else pd.DataFrame()
         manifest = json.loads((logger.root / "config/run_manifest.json").read_text(encoding="utf-8"))
         manifest["optimizer"] = args.optimizer
+        manifest["turnover_optimizer"] = args.turnover_optimizer
+        manifest["drawdown_optimizer"] = args.drawdown_optimizer
         logger.json("config/run_manifest.json", manifest)
         report = ReportGenerator().generate(logger.root / "report/index.html", logger.run_id,
             {**asdict(cfg), "optimizer": args.optimizer},

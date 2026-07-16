@@ -25,10 +25,10 @@ class ExistingDataAdapter:
 
     @staticmethod
     def prepare_missing_factors(frame: pd.DataFrame, features: list[str]) -> tuple[pd.DataFrame, dict[str, int]]:
-        """统一处理已标准化因子的缺失值，所有模型只调用这一个入口。
+        """删除全因子缺失行，并将部分缺失保留到模型预处理阶段。
 
-        全因子缺失的股票日样本没有可用信息，直接删除；部分缺失直接以代表
-        中性暴露的0填充，不再生成缺失指示变量，保持原始特征维度。
+        缺失值不能在这里提前填0：线性模型先使用训练期非缺失观测拟合标准化
+        参数，风格模型先计算当日截面统计量，之后才将剩余缺失值填为中性值0。
         """
         if not features:
             raise ValueError("因子文件没有数值因子列")
@@ -44,11 +44,10 @@ class ExistingDataAdapter:
         for feature in features:
             missing = out[feature].isna().to_numpy()
             partial_rows |= missing
-            if missing.any():
-                out.loc[missing, feature] = 0.0
         return out, {"original_factor_missing_cells": original_missing,
                      "all_factor_missing_rows_dropped": dropped,
-                     "partial_factor_missing_rows_kept": int(partial_rows.sum())}
+                     "partial_factor_missing_rows_kept": int(partial_rows.sum()),
+                     "partial_factor_missing_cells_preserved": int(out[features].isna().sum().sum())}
 
     def load(self, start: str | None = None, end: str | None = None) -> MLDataBundle:
         for path in (self.factor_path, self.twap_path, self.adj_path, self.calendar_path):

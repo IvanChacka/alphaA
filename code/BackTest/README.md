@@ -11,7 +11,7 @@ pip install -r requirements.text
 python web_app.py
 ```
 
-浏览器访问 `http://127.0.0.1:8001`。网页可以选择：
+浏览器访问 `http://127.0.0.1:8000`。网页可以选择：
 
 - 因子或模型
 - A500、中证1000或全市场票池

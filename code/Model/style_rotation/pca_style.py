@@ -21,7 +21,7 @@ def varimax(loadings: np.ndarray, gamma: float = 1.0, max_iter: int = 200,
 
 
 class FixedPCAStyle:
-    """以日截面相关矩阵的时间均值拟合一次，并冻结旋转载荷。"""
+    """以历史日截面相关矩阵的时间均值拟合一次，并永久冻结旋转载荷。"""
 
     def __init__(self, explained_variance: float = STYLE_EXPLAINED_VARIANCE,
                  min_components: int = STYLE_MIN_COMPONENTS):

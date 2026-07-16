@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>2024样本外模型与策略对比分析</title>
+  <style>
+    :root{color-scheme:dark;--bg:#08111f;--panel:#101d31;--panel2:#0c1728;--line:#263a58;--text:#eaf1fb;--muted:#9aabc2;--green:#45db8a;--blue:#62a8ff;--gold:#f5c451;--red:#fa7187}
+    *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.65 system-ui,"Microsoft YaHei",sans-serif}main{max-width:1380px;margin:auto;padding:28px}
+    a{color:#8fc2ff;text-decoration:none}a:hover{text-decoration:underline}h1{margin:0;font-size:28px}h2{font-size:20px;margin:30px 0 12px}h3{margin:0 0 8px}.header{display:flex;justify-content:space-between;align-items:flex-end;gap:18px}.muted{color:var(--muted)}
+    .cards{display:grid;grid-template-columns:repeat(5,1fr);gap:11px;margin-top:20px}.card,.panel{background:var(--panel);border:1px solid var(--line);border-radius:11px;padding:15px}.card b{display:block;font-size:22px;margin:4px 0}.good{color:var(--green)}.gold{color:var(--gold)}.bad{color:var(--red)}
+    .tag{display:inline-block;border:1px solid #2e6a50;background:#143425;color:#7ff0ac;border-radius:999px;padding:2px 9px;font-size:12px}.links{white-space:nowrap}.grid{display:grid;grid-template-columns:1fr 1fr;gap:13px}.panel ul,.panel ol{padding-left:20px;margin:7px 0}
+    .table-wrap{overflow:auto;border:1px solid var(--line);border-radius:11px}table{border-collapse:collapse;width:100%;min-width:1040px;background:var(--panel)}th,td{padding:10px 11px;border-bottom:1px solid var(--line);text-align:right;white-space:nowrap}th{background:var(--panel2);color:var(--muted);font-weight:600}th:first-child,td:first-child{text-align:left}tr:last-child td{border-bottom:0}tr.best td{background:#123627}tr.challenger td{background:#262510}
+    .reason{display:grid;grid-template-columns:repeat(4,1fr);gap:11px}.reason .panel b{color:var(--green);font-size:18px}.note{background:#272314;border-left:3px solid var(--gold);padding:12px 15px;border-radius:7px;margin-top:14px}.flow{font-family:Consolas,monospace;white-space:pre-wrap;background:#07101d;border:1px solid var(--line);border-radius:10px;padding:16px;color:#c9dcf5}
+    footer{margin:28px 0 4px;color:var(--muted)}
+    @media(max-width:1000px){.cards{grid-template-columns:repeat(3,1fr)}.reason{grid-template-columns:1fr 1fr}}
+    @media(max-width:680px){main{padding:17px}.header{display:block}.links{margin-top:10px}.cards,.grid,.reason{grid-template-columns:1fr}}
+  </style>
+</head>
+<body><main>
+  <div class="header">
+    <div><span class="tag">更新至最新报告</span><h1>2024样本外模型与策略对比</h1><div class="muted">全市场选股 · ZZ1000基准 · 初始资金1亿元 · 双边14bp · 超额指标采用相对净值口径</div></div>
+    <div class="links"><a href="analysis.md">详细分析</a> · <a href="strategy_evolution.md">策略调整全过程</a> · <a href="comparison.csv">结构化数据</a></div>
+  </div>
+
+  <div class="cards">
+    <div class="card"><span class="muted">当前最优策略</span><b class="good">PCA90 StyleRotation</b><small>无残差 + 惰性换手 + QP仓位</small></div>
+    <div class="card"><span class="muted">年化 / 累计</span><b>15.16% / 14.46%</b><small>2024样本外</small></div>
+    <div class="card"><span class="muted">夏普 / 最大回撤</span><b>0.677 / -17.06%</b><small>相对未优化版本回撤约减半</small></div>
+    <div class="card"><span class="muted">超额年化 / 超额夏普</span><b>13.08% / 0.751</b><small>相对ZZ1000净值计算</small></div>
+    <div class="card"><span class="muted">RankIC / ICIR</span><b>0.0396 / 0.3967</b><small>正IC日67.36%</small></div>
+  </div>
+
+  <h2>为什么选择当前版本</h2>
+  <div class="reason">
+    <section class="panel"><b>风险明显下降</b><p>相对未优化StyleRotation，最大回撤从34.12%降到17.06%，年化只减少1.67个百分点。</p></section>
+    <section class="panel"><b>交易成本可控</b><p>换手15.82、费用209.84万元，较未优化版本分别下降75.7%和75.2%。</p></section>
+    <section class="panel"><b>信号更稳定</b><p>关闭残差后RankIC 0.0396、ICIR 0.3967，显著高于残差权重1.0版本的0.0328和0.259。</p></section>
+    <section class="panel"><b>结构更精简</b><p>PCA90用13个风格保留90.33%信息；相对PCA95减少3个成分，IC基本不变，换手和费用再降约20%。</p></section>
+  </div>
+
+  <h2>统一口径对比</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>模型/策略</th><th>年化</th><th>夏普</th><th>最大回撤</th><th>超额年化</th><th>超额夏普</th><th>RankIC</th><th>ICIR</th><th>换手</th><th>费用</th></tr></thead>
+    <tbody>
+      <tr><td>LinearRegression</td><td>10.25%</td><td>0.443</td><td>-37.69%</td><td>8.25%</td><td>0.473</td><td>0.0497</td><td>0.355</td><td>43.42</td><td>531.39万</td></tr>
+      <tr><td>Ridge</td><td>6.97%</td><td>0.375</td><td>-42.37%</td><td>5.04%</td><td>0.322</td><td>0.0434</td><td>0.286</td><td>57.92</td><td>696.27万</td></tr>
+      <tr><td>ElasticNet*</td><td class="bad">-3.69%</td><td>0.147</td><td>-45.13%</td><td>-5.43%</td><td>-0.064</td><td>0.0492</td><td>0.299</td><td>72.95</td><td>812.85万</td></tr>
+      <tr><td>普通XGBoost</td><td>2.12%</td><td>0.267</td><td>-43.31%</td><td>0.28%</td><td>0.138</td><td>0.0481</td><td>0.309</td><td>64.04</td><td>747.78万</td></tr>
+      <tr><td>未优化StyleRotation</td><td>16.83%</td><td>0.585</td><td>-34.12%</td><td>14.72%</td><td>0.756</td><td>0.0414</td><td>0.345</td><td>64.96</td><td>847.49万</td></tr>
+      <tr class="challenger"><td>收益挑战者：PCA95 + 残差1.0 + QP</td><td><b>17.47%</b></td><td><b>0.775</b></td><td>-18.15%</td><td><b>15.35%</b></td><td><b>0.880</b></td><td>0.0328</td><td>0.259</td><td>21.74</td><td>289.71万</td></tr>
+      <tr class="challenger"><td>成本挑战者：PCA95 + 残差0.3 + QP</td><td>16.42%</td><td>0.729</td><td>-17.66%</td><td>14.31%</td><td>0.824</td><td>0.0335</td><td>0.312</td><td><b>13.78</b></td><td><b>183.14万</b></td></tr>
+      <tr><td>PCA95 + 无残差 + QP</td><td>15.50%</td><td>0.719</td><td>-17.21%</td><td>13.41%</td><td>0.769</td><td><b>0.0400</b></td><td>0.389</td><td>19.86</td><td>264.31万</td></tr>
+      <tr class="best"><td><b>当前最优：PCA90 + 无残差 + 惰性换手 + QP</b></td><td>15.16%</td><td>0.677</td><td><b>-17.06%</b></td><td>13.08%</td><td>0.751</td><td>0.0396</td><td><b>0.397</b></td><td>15.82</td><td>209.84万</td></tr>
+    </tbody>
+  </table></div>
+  <p class="note"><b>选择标准：</b>当前版本不是2024年化最高的版本，而是稳健性主策略。残差版本保留为挑战者，等多年度独立样本确认后再决定是否加入。ElasticNet使用旧缺失处理顺序，需要重跑。</p>
+
+  <h2>PCA诊断：压缩没有破坏信号</h2>
+  <p class="muted">比较使用2024年相同日期和标签；原始因子按各自非缺失观测计算，PCA风格按模型实际预处理后的截面计算。</p>
+  <div class="grid">
+    <div class="table-wrap"><table style="min-width:620px">
+      <thead><tr><th>对象</th><th>数量</th><th>平均RankIC</th><th>中位数</th><th>最高</th><th>最低</th></tr></thead>
+      <tbody><tr><td>原始因子</td><td>30</td><td>0.0163</td><td>0.0154</td><td>0.0456</td><td>-0.0124</td></tr><tr class="best"><td>PCA90风格</td><td>13</td><td><b>0.0211</b></td><td><b>0.0193</b></td><td><b>0.0489</b></td><td><b>-0.0018</b></td></tr></tbody>
+    </table></div>
+    <section class="panel"><h3>诊断结论</h3><ul><li>13个PCA风格保留90.33%协方差信息。</li><li>12个风格全年RankIC为正。</li><li>最优`style_4` RankIC为0.0489。</li><li>原始因子平均RankIC本身只有0.0163，单风格IC小不是压缩程序错误。</li></ul></section>
+  </div>
+
+  <h2>当前策略季度路径</h2>
+  <div class="table-wrap"><table style="min-width:720px">
+    <thead><tr><th>季度</th><th>策略收益</th><th>最终分数RankIC</th><th>解释</th></tr></thead>
+    <tbody><tr><td>2024Q1</td><td>-8.14%</td><td>0.0499</td><td style="text-align:left">动态降仓限制年初损失</td></tr><tr><td>2024Q2</td><td>-6.81%</td><td>0.0218</td><td style="text-align:left">全年信号最弱阶段</td></tr><tr><td>2024Q3</td><td>+16.20%</td><td>0.0353</td><td style="text-align:left">捕捉市场反弹</td></tr><tr><td>2024Q4</td><td>+15.07%</td><td>0.0518</td><td style="text-align:left">分层收益与信号同步改善</td></tr></tbody>
+  </table></div>
+
+  <h2>最终执行链</h2>
+  <div class="flow">30个原始因子
+  → 当日截面标准化，缺失值最后填0
+  → 2020—2021固定PCA载荷，压缩为13个风格
+  → 5日/20日XGBoost预测风格未来收益
+  → 15日滚动ICIR动态合成
+  → 风格投票生成Top 200候选分数
+  → residual_weight=0
+  → lazy_turnover分级卖出与惰性持仓
+  → quadratic_drawdown决定30%—100%总仓位
+  → 原BackTest框架按TWAP、等权和交易限制执行</div>
+
+  <div class="grid" style="margin-top:14px">
+    <section class="panel"><h3>当前参数应冻结</h3><p>接下来不应继续根据2024结果修改PCA解释率、残差权重、ICIR窗口和投票阈值，否则2024会从样本外测试集退化为验证集。</p></section>
+    <section class="panel"><h3>下一步验证</h3><ol><li>独立年份滚动验证。</li><li>ZZ1000、A500成分池迁移测试。</li><li>28bp费用和冲击成本压力测试。</li><li>最后单独测试行业中性化。</li></ol></section>
+  </div>
+
+  <h2>本地运行记录</h2>
+  <section class="panel">
+    <p>为避免上传大体积运行产物，GitHub只保留汇总指标。可在本地对应运行目录查看完整静态报告：</p>
+    <p><b>当前最优：</b><code>run_20260716_165342_style_rotation</code>　
+    <b>PCA95无残差：</b><code>run_20260716_161418_style_rotation</code>　
+    <b>残差0.3：</b><code>run_20260716_155447_style_rotation</code>　
+    <b>残差1.0：</b><code>run_20260716_150455_style_rotation</code></p>
+    <p><b>未优化StyleRotation：</b><code>run_20260716_134902_style_rotation</code>　
+    <b>Linear：</b><code>run_20260716_134040_linear_regression</code>　
+    <b>Ridge：</b><code>run_20260716_134359_ridge</code>　
+    <b>XGBoost：</b><code>run_20260716_130042_xgboost</code></p>
+  </section>
+  <footer>数据来自各运行目录的metrics.json、summary.csv、nav_curve.csv、PCA审计文件和统一口径复算结果。详细依据见analysis.md，完整调整过程见strategy_evolution.md。</footer>
+</main></body></html>

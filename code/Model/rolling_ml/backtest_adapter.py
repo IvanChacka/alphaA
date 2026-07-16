@@ -1,6 +1,7 @@
 from imports import *
 from env import BACKTEST_DIR
-from optimizers import create_optimizer
+from optimizers import (create_drawdown_optimizer, create_optimizer,
+                        create_turnover_optimizer)
 
 
 class BacktestAdapter:
@@ -30,7 +31,9 @@ class BacktestAdapter:
                 "pool_icir": float(icir)}
 
     def run(self, predictions: pd.DataFrame, market: str, output_root: Path, model_name: str,
-            retain_signals: pd.DataFrame | None = None, optimizer_name: str = "none"):
+            optimizer_name: str = "none", turnover_optimizer_name: str = "none",
+            drawdown_optimizer_name: str = "none", sell_confirmations: int = 2,
+            max_turnover_ratio: float = .30, max_drawdown_limit: float = .20):
         from analytics import performance
         from backtest import BacktestEngine
         from config import BacktestConfig
@@ -38,20 +41,37 @@ class BacktestAdapter:
 
         wide = self.prediction_wide(predictions)
         # 先让现有加载器按其默认合法信号完成行情/票池加载，随后仅替换内存中的factor。
-        cfg = BacktestConfig(market=market, start_date=str(wide.index.min().date()),
-                             end_date=str(wide.index.max().date()), signal="default_factor")
+        turnover_optimizer = create_turnover_optimizer(
+            turnover_optimizer_name, sell_confirmations, max_turnover_ratio)
+        drawdown_optimizer = create_drawdown_optimizer(
+            drawdown_optimizer_name, max_drawdown_limit)
+        cfg = BacktestConfig(
+            market=market, start_date=str(wide.index.min().date()),
+            end_date=str(wide.index.max().date()), signal="default_factor",
+            max_turnover_ratio=(turnover_optimizer.max_turnover_ratio
+                                if turnover_optimizer.max_turnover_ratio is not None else .30),
+            max_drawdown_limit=drawdown_optimizer.max_drawdown_limit)
         data = MarketData(cfg).load()
         common_dates = data["twap"].index.intersection(wide.index)
         common_codes = data["twap"].columns.intersection(wide.columns)
         for key in ("twap", "close", "adj", "st", "pool"):
             data[key] = data[key].reindex(index=common_dates, columns=common_codes)
         data["factor"] = wide.reindex(index=common_dates, columns=common_codes)
-        if retain_signals is not None and not retain_signals.empty:
-            retain = retain_signals.copy()
-            retain["symbol"] = retain.symbol.astype(str).str.zfill(6)
-            retain_wide = retain.pivot_table(index="factor_date", columns="symbol", values="retain",
-                                             aggfunc="last").astype(bool)
-            data["retain"] = retain_wide.reindex(index=common_dates, columns=common_codes, fill_value=False)
+        normalized_predictions = predictions.copy()
+        normalized_predictions["factor_date"] = pd.to_datetime(normalized_predictions.factor_date)
+        normalized_predictions["symbol"] = normalized_predictions.symbol.astype(str).str.zfill(6)
+        retain_wide, turnover_audit = turnover_optimizer.build_retain(
+            normalized_predictions, common_dates, common_codes)
+        if retain_wide is not None:
+            data["retain"] = retain_wide
+        trade_enabled, drawdown_audit = drawdown_optimizer.build_trade_gate(
+            normalized_predictions, common_dates)
+        if trade_enabled is not None:
+            data["trade_enabled"] = trade_enabled
+        if getattr(drawdown_optimizer, "name", "none") != "none":
+            data["drawdown_optimizer"] = drawdown_optimizer
+            data["risk_off"] = drawdown_audit.set_index("factor_date")["risk_off"].reindex(
+                common_dates, fill_value=False).astype(bool)
         data["benchmark"] = data["benchmark"].reindex(common_dates)
         root = Path(output_root)
         for name in ("results", "trades", "holdings", "adjustments", "audit"):
@@ -61,6 +81,14 @@ class BacktestAdapter:
         if not optimizer_audit.empty:
             optimizer_audit.to_csv(
                 root / "audit" / f"{model_name}_{market}_{optimizer_name}.csv",
+                index=False, encoding="utf-8-sig")
+        if not turnover_audit.empty:
+            turnover_audit.to_csv(
+                root / "audit" / f"{model_name}_{market}_{turnover_optimizer_name}.csv",
+                index=False, encoding="utf-8-sig")
+        if not drawdown_audit.empty:
+            drawdown_audit.to_csv(
+                root / "audit" / f"{model_name}_{market}_{drawdown_optimizer_name}.csv",
                 index=False, encoding="utf-8-sig")
         live_path = root / "results" / f"{model_name}_{market}_live.json"
         live_curve: list[dict[str, Any]] = []
@@ -85,6 +113,8 @@ class BacktestAdapter:
         result.orders.to_csv(root / "trades" / f"{model_name}_{market}_orders.csv", index=False, encoding="utf-8-sig")
         result.trades.to_csv(root / "trades" / f"{model_name}_{market}_closed_trades.csv", index=False, encoding="utf-8-sig")
         result.holdings.to_csv(root / "holdings" / f"{model_name}_{market}_holdings_daily.csv", index=False, encoding="utf-8-sig")
+        result.risk_events.to_csv(root / "audit" / f"{model_name}_{market}_risk_events.csv",
+                                  index=False, encoding="utf-8-sig")
 
         adjustments = []
         if not result.holdings.empty:
@@ -101,8 +131,6 @@ class BacktestAdapter:
 
         metrics, curve = performance(result.account, result.benchmark, cfg.annual_days, cfg.risk_free_rate)
         pool_rank_ic, pool_ic_stock_count, pool_signal_coverage = [], [], []
-        normalized_predictions = predictions.copy()
-        normalized_predictions["symbol"] = normalized_predictions.symbol.astype(str).str.zfill(6)
         for date, group in normalized_predictions.groupby("factor_date"):
             date = pd.Timestamp(date)
             if date not in data["pool"].index:
@@ -124,7 +152,13 @@ class BacktestAdapter:
                         "pool_rank_ic_positive_ratio": float(np.mean(np.asarray(pool_rank_ic) > 0)) if pool_rank_ic else np.nan,
                         "pool_ic_average_stock_count": float(np.nanmean(pool_ic_stock_count)) if pool_ic_stock_count else np.nan,
                         "pool_signal_coverage": float(np.nanmean(pool_signal_coverage)) if pool_signal_coverage else np.nan,
-                        "optimizer": optimizer_name})
+                        "optimizer": optimizer_name,
+                        "turnover_optimizer": turnover_optimizer_name,
+                        "drawdown_optimizer": drawdown_optimizer_name,
+                        "risk_paused_days": int((~result.risk_events.trade_enabled).sum()),
+                        "qp_adjustment_days": int((result.risk_events.target_exposure < .999).sum()),
+                        "average_target_exposure": float(result.risk_events.target_exposure.mean()),
+                        "minimum_target_exposure": float(result.risk_events.target_exposure.min())})
         curve.to_csv(result_dir / "nav_curve.csv", encoding="utf-8-sig")
         (result_dir / "metrics.json").write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
         first_order = result.orders.date.min() if not result.orders.empty else pd.NaT
@@ -134,7 +168,8 @@ class BacktestAdapter:
             {"check": "curve_matches_account", "value": bool(np.allclose(curve.strategy, result.account.total_asset / result.account.total_asset.iloc[0])), "passed": bool(np.allclose(curve.strategy, result.account.total_asset / result.account.total_asset.iloc[0]))},
             {"check": "prediction_kept_on_t0", "value": str(wide.index.min()), "passed": wide.index.min() == common_dates.min()},
             {"check": "first_trade_uses_previous_signal", "value": str(first_order), "passed": pd.Timestamp(first_order) == pd.Timestamp(expected_first_trade)},
-            {"check": "retain_signal_enabled", "value": retain_signals is not None and not retain_signals.empty, "passed": True},
+            {"check": "turnover_optimizer", "value": turnover_optimizer_name, "passed": True},
+            {"check": "drawdown_optimizer", "value": drawdown_optimizer_name, "passed": True},
             {"check": "score_optimizer", "value": optimizer_name, "passed": optimizer_name in {"none", "industry_neutral"}},
             {"check": "industry_neutral_max_abs_mean",
              "value": float(optimizer_audit.max_abs_industry_mean.max()) if not optimizer_audit.empty else np.nan,

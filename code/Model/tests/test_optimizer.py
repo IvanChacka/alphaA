@@ -2,7 +2,9 @@ from imports import *
 import pytest
 
 from optimizers.base import NoOptimizer
+from optimizers.drawdown import MaxDrawdownOptimizer
 from optimizers.industry_neutral import IndustryNeutralOptimizer
+from optimizers.turnover import LazyTurnoverOptimizer
 
 
 def _scores_and_pool():
@@ -55,3 +57,38 @@ def test_no_optimizer_is_identity_copy():
     pd.testing.assert_frame_equal(optimized, scores)
     assert optimized is not scores
     assert audit.empty
+
+
+def test_lazy_holding_is_created_only_by_turnover_optimizer():
+    date = pd.Timestamp("2024-01-02")
+    predictions = pd.DataFrame({
+        "factor_date": [date] * 3,
+        "symbol": ["000001", "000002", "000003"],
+        "sell_votes": [0, 1, 2],
+    })
+    optimizer = LazyTurnoverOptimizer(sell_confirmations=2, max_turnover_ratio=.25)
+    retain, audit = optimizer.build_retain(
+        predictions, pd.DatetimeIndex([date]), pd.Index(predictions.symbol))
+    assert retain.loc[date].to_dict() == {
+        "000001": True, "000002": True, "000003": False}
+    assert audit.loc[0, "sell_confirmations"] == 2
+    assert audit.loc[0, "max_turnover_ratio"] == .25
+
+
+def test_quadratic_drawdown_optimizer_keeps_trading_and_reduces_exposure():
+    dates = pd.to_datetime(["2024-01-02", "2024-01-03"])
+    predictions = pd.DataFrame({
+        "factor_date": [dates[0], dates[1]],
+        "risk_off": [False, True],
+    })
+    optimizer = MaxDrawdownOptimizer(.15)
+    gate, audit = optimizer.build_trade_gate(
+        predictions, pd.DatetimeIndex(dates))
+    assert gate.to_dict() == {dates[0]: True, dates[1]: True}
+    assert audit.loc[audit.factor_date == dates[1], "risk_off"].item()
+    assert audit.method.eq("quadratic_drawdown").all()
+    calm = optimizer.optimize_exposure(0.0, [.002] * 20, 1.0, False)
+    stressed = optimizer.optimize_exposure(-.15, [-.02, -.01] * 10, 1.0, True)
+    assert calm["qp_status"] == "optimal"
+    assert stressed["target_exposure"] < calm["target_exposure"]
+    assert optimizer.min_exposure <= stressed["target_exposure"] <= 1.0

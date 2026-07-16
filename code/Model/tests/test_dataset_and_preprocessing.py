@@ -2,6 +2,7 @@ from imports import *
 from rolling_ml.dataset_builder import DatasetBuilder
 from rolling_ml.data_loader import ExistingDataAdapter
 from rolling_ml.preprocessing import FeaturePreprocessor
+from style_rotation.preprocessing import CrossSectionalPreprocessor
 
 
 def test_unlabeled_tail_is_kept_for_prediction():
@@ -28,20 +29,47 @@ def test_linear_preprocessor_restores_standardization():
     assert np.isclose(transformed.std(ddof=0), 1.0, atol=1e-6)
 
 
-def test_preprocessor_rejects_dirty_factors_instead_of_filling():
-    dirty = pd.DataFrame({"factor_date": pd.to_datetime(["2024-01-02"] * 2), "alpha": [1.0, np.nan]})
-    with np.testing.assert_raises_regex(ValueError, "NaN=1"):
-        FeaturePreprocessor().fit_transform(FeaturePreprocessor.cross_sectional(dirty, ["alpha"]))
+def test_preprocessor_standardizes_observed_values_before_filling_missing():
+    train = pd.DataFrame({"alpha": [1.0, 3.0, np.nan]})
+    test = pd.DataFrame({"alpha": [5.0, np.nan]})
+    processor = FeaturePreprocessor(scale=True)
+    transformed_train = processor.fit_transform(train)
+    transformed_test = processor.transform(test)
+    assert np.allclose(transformed_train.ravel(), [-1.0, 1.0, 0.0])
+    # Uses training mean=2 and std=1; the test sample is not used to refit.
+    assert np.allclose(transformed_test.ravel(), [3.0, 0.0])
 
 
-def test_missing_factors_are_zero_filled_once_before_models():
+def test_unscaled_preprocessor_fills_only_missing_values_at_model_boundary():
+    values = pd.DataFrame({"alpha": [1.0, np.nan, -2.0]})
+    transformed = FeaturePreprocessor(scale=False).fit_transform(values)
+    assert np.array_equal(transformed.ravel(), np.array([1.0, 0.0, -2.0], dtype=np.float32))
+
+
+def test_preprocessor_rejects_infinite_factors_instead_of_silently_filling():
+    dirty = pd.DataFrame({"alpha": [1.0, np.inf]})
+    with np.testing.assert_raises_regex(ValueError, "Inf=1"):
+        FeaturePreprocessor().fit_transform(dirty)
+
+
+def test_data_adapter_drops_all_missing_rows_but_preserves_partial_missing():
     frame = pd.DataFrame({"factor_date": pd.to_datetime(["2024-01-02"] * 3),
                           "symbol": ["000001", "000002", "000003"],
                           "alpha_0": [1.0, np.nan, np.nan],
                           "alpha_1": [np.nan, 2.0, np.nan]})
     result, stats = ExistingDataAdapter.prepare_missing_factors(frame, ["alpha_0", "alpha_1"])
     assert result.symbol.tolist() == ["000001", "000002"]
-    assert result[["alpha_0", "alpha_1"]].isna().sum().sum() == 0
-    assert result[["alpha_0", "alpha_1"]].to_numpy().tolist() == [[1.0, 0.0], [0.0, 2.0]]
+    assert result[["alpha_0", "alpha_1"]].isna().sum().sum() == 2
     assert not any(column.endswith("_missing") for column in result.columns)
     assert stats["all_factor_missing_rows_dropped"] == 1
+    assert stats["partial_factor_missing_cells_preserved"] == 2
+
+
+def test_style_preprocessor_standardizes_daily_observations_before_filling():
+    frame = pd.DataFrame({
+        "factor_date": pd.to_datetime(["2024-01-02"] * 3),
+        "symbol": ["000001", "000002", "000003"],
+        "alpha": [1.0, 3.0, np.nan],
+    })
+    transformed = CrossSectionalPreprocessor().transform(frame, ["alpha"])
+    assert np.allclose(transformed["alpha"].to_numpy(), [-1.0, 1.0, 0.0])

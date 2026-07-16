@@ -40,12 +40,15 @@ class ReportGenerator:
     def generate(self, path: Path, run_id: str, config: dict, daily_metrics: pd.DataFrame,
                  summaries: pd.DataFrame, training_records: pd.DataFrame, failures=None,
                  trials=None, backtests=None, backtest_curves=None, details=None,
-                 parameter_importance=None, feature_importance=None, manifest=None) -> Path:
+                 parameter_importance=None, feature_importance=None, manifest=None,
+                 pca_style_metrics=None) -> Path:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         trials = pd.DataFrame() if trials is None else trials
         backtests = pd.DataFrame() if backtests is None else backtests
         backtest_curves = pd.DataFrame() if backtest_curves is None else backtest_curves
+        pca_style_metrics = (pd.DataFrame() if pca_style_metrics is None
+                             else pca_style_metrics)
         details = details or {}
 
         daily_fig = go.Figure()
@@ -61,8 +64,8 @@ class ReportGenerator:
         quarterly_fig.update_layout(title="最终股票分数季度Mean RankIC", template="plotly_white")
 
         style_generalization_fig = go.Figure()
-        style_columns = {"train_rank_ic_5", "validation_rank_ic_5", "oos_style_rank_ic_5",
-                         "train_rank_ic_20", "validation_rank_ic_20", "oos_style_rank_ic_20"}
+        style_columns = {"train_rank_ic_5", "oos_style_rank_ic_5",
+                         "train_rank_ic_20", "oos_style_rank_ic_20"}
         if not training_records.empty and style_columns.issubset(training_records.columns):
             ordered = training_records.sort_values(["model", "quarter"])
             for model, group in ordered.groupby("model"):
@@ -72,13 +75,13 @@ class ReportGenerator:
                         style_generalization_fig.add_scatter(
                             x=group.quarter, y=group[column], name=f"{model} {horizon}日{scope}",
                             mode="lines+markers")
-                    style_generalization_fig.add_scatter(
-                        x=[group.quarter.iloc[0]],
-                        y=[group[f"validation_rank_ic_{horizon}"].iloc[0]],
-                        name=f"{model} {horizon}日固定20日隔离验证（单点）",
-                        mode="markers", marker={"size": 11})
+        if not pca_style_metrics.empty:
+            for style, group in pca_style_metrics.sort_values("quarter").groupby("style"):
+                style_generalization_fig.add_scatter(
+                    x=group.quarter, y=group.mean_rank_ic,
+                    name=f"PCA {style} 股票RankIC", mode="lines+markers")
         style_generalization_fig.update_layout(
-            title="同口径跨风格RankIC（预测收益 vs 同期限实现收益）",
+            title="风格模型拟合/调参与PCA成分股票RankIC",
             template="plotly_white")
 
         trial_fig = go.Figure()
@@ -122,6 +125,7 @@ class ReportGenerator:
                   self._table("Optuna Trial", trials, "optuna/<year>_trials.csv"),
                   self._table("Optuna参数重要性", pd.DataFrame() if parameter_importance is None else parameter_importance, "optuna/<year>_parameter_importance.csv"),
                   self._table("模型特征重要性", pd.DataFrame() if feature_importance is None else feature_importance, "models/<model>/<quarter>/feature_importance.csv"),
+                  self._table("PCA每个风格RankIC", pca_style_metrics, "metrics/pca_style_rankic.csv"),
                   self._table("回测汇总", backtests, "backtest/results/summary.csv")]
         labels = {"account": "账户每日记录", "orders": "成交记录", "trades": "平仓交易记录",
                   "holdings": "每日收盘持仓", "adjustments": "复权因子调整记录"}

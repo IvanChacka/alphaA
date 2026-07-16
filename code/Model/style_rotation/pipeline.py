@@ -1,6 +1,6 @@
 from imports import *
-from env import (STYLE_MODELS, STYLE_PCA_END, STYLE_PCA_START, STYLE_TIME_DECAY_HALFLIFE,
-                 STYLE_TIMING_TRAIN_START)
+from env import (STYLE_MODELS, STYLE_PCA_END, STYLE_PCA_START,
+                 STYLE_TIME_DECAY_HALFLIFE, STYLE_TIMING_TRAIN_START)
 from rolling_ml.data_loader import ExistingDataAdapter
 from rolling_ml.label_builder import LabelBuilder
 from rolling_ml.metrics import daily_ic, layered_metrics
@@ -95,7 +95,8 @@ class StyleRotationPipeline:
         """用已实现的XGB预测ICIR门控5日/20日权重，并用市场状态微调。
 
         固定验证IC只在尚无足够样本外预测记录时作为先验。达到最少观察数后，
-        某期限滚动ICIR不为正则权重归零；两个期限都失效时不产生新买入信号。
+        某期限滚动ICIR不为正则实时权重归零。两个期限都失效时只输出risk_off，
+        预测分数回退到冻结的验证权重；是否暂停交易由最大回撤优化器决定。
         """
         forecast_ic_history = (pd.DataFrame(columns=["decision_date", "label_exit_date",
                                                       "horizon", "model_rank_ic"])
@@ -130,12 +131,21 @@ class StyleRotationPipeline:
             short_raw = strength5 * (.5 + vol_percentile)
             medium_raw = strength20 * (.5 + min(trend_strength, 1.5))
             total = short_raw + medium_raw
-            weight5 = short_raw / total if total > 1e-12 else 0.0
-            weight20 = medium_raw / total if total > 1e-12 else 0.0
+            risk_off = total <= 1e-12
+            if risk_off:
+                short_raw = max(float(model_validation_ic_5 or 0.0), 0.0) * (.5 + vol_percentile)
+                medium_raw = max(float(model_validation_ic_20 or 0.0), 0.0) * (
+                    .5 + min(trend_strength, 1.5))
+                total = short_raw + medium_raw
+                if total <= 1e-12:
+                    short_raw = medium_raw = total = 1.0
+            weight5 = short_raw / total
+            weight20 = medium_raw / total
             rows.append({"decision_date": date, "weight_5": weight5,
                          "weight_20": weight20, "rolling_icir_5": icir5,
                          "rolling_icir_20": icir20, "market_volatility_percentile": vol_percentile,
                          "market_trend_strength": trend_strength,
+                         "risk_off": risk_off,
                          "model_ic_observations_5": count5,
                          "model_ic_observations_20": count20,
                          "model_validation_ic_5": model_validation_ic_5,
@@ -147,9 +157,8 @@ class StyleRotationPipeline:
     @staticmethod
     def _consensus_stock_scores(exposure: pd.DataFrame, forecast: pd.DataFrame,
                                 styles: list[str], buy_confirmations: int = 1,
-                                sell_confirmations: int = 2,
                                 vote_quantile: float = .90
-                                ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+                                ) -> tuple[pd.DataFrame, pd.DataFrame]:
         merged = exposure.merge(forecast, left_on="factor_date", right_on="decision_date",
                                 suffixes=("_exposure", "_forecast"))
         contributions = np.column_stack([
@@ -173,12 +182,9 @@ class StyleRotationPipeline:
         out["prediction"] = np.where(eligible, bullish_score + .05 * buy_votes, np.nan)
         out["prediction"] = out.groupby("factor_date").prediction.transform(
             lambda x: (x - x.mean()) / x.std(ddof=0) if x.notna().sum() > 1 and x.std(ddof=0) > 1e-12 else x)
-        retain = out[["factor_date", "symbol"]].copy()
-        # 只有多个风格共同看空才允许BackTest卖出；中性状态继续持有。
-        retain["retain"] = sell_votes < sell_confirmations
         votes = out[["factor_date", "symbol"]].copy()
         votes["buy_votes"], votes["sell_votes"], votes["buy_eligible"] = buy_votes, sell_votes, eligible
-        return out, retain, votes
+        return out, votes
 
     @staticmethod
     def _standardize_score(frame: pd.DataFrame, column: str) -> pd.Series:
@@ -223,6 +229,44 @@ class StyleRotationPipeline:
         return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
     @staticmethod
+    def _pca_style_rankic(contexts: dict[pd.Period, dict[str, Any]],
+                          labels: pd.DataFrame,
+                          styles: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """Measure each frozen PCA component against next-period stock returns.
+
+        The calculation is restricted to each prediction quarter.  It is a
+        daily cross-sectional Spearman RankIC, so the report can show whether
+        an individual PCA style is useful without mixing in the XGBoost timing
+        forecast or its embargo-validation score.
+        """
+        daily_frames = []
+        label_frame = labels[["factor_date", "symbol", "label"]]
+        for quarter, context in contexts.items():
+            exposure = context["exposure"]
+            quarter_exposure = exposure[
+                exposure.factor_date.dt.to_period("Q") == quarter]
+            evaluated = quarter_exposure.merge(
+                label_frame, on=["factor_date", "symbol"], how="left",
+                validate="one_to_one")
+            for style in styles:
+                daily_frames.append(
+                    daily_ic(evaluated, prediction=style).assign(
+                        quarter=str(quarter), style=style))
+        if not daily_frames:
+            return pd.DataFrame(), pd.DataFrame()
+        daily = pd.concat(daily_frames, ignore_index=True)
+        summary = daily.groupby(["quarter", "style"], observed=True).agg(
+            mean_rank_ic=("rank_ic", "mean"),
+            rank_ic_std=("rank_ic", "std"),
+            positive_ratio=("rank_ic", lambda values: float((values.dropna() > 0).mean())),
+            observation_days=("rank_ic", "count"),
+            average_stock_count=("stock_count", "mean"),
+        ).reset_index()
+        summary["icir"] = (
+            summary.mean_rank_ic / summary.rank_ic_std.replace(0, np.nan))
+        return daily, summary
+
+    @staticmethod
     def _build_residual_target(frame: pd.DataFrame, styles: list[str]
                                ) -> tuple[pd.Series, pd.DataFrame]:
         """逐日从已实现股票收益中剔除PCA风格暴露可解释的部分。
@@ -251,6 +295,77 @@ class StyleRotationPipeline:
                                "max_abs_style_correlation": max(correlations, default=np.nan)})
         return pd.Series(result, index=frame.index, name="residual_label"), pd.DataFrame(audit_rows)
 
+    @staticmethod
+    def _fixed_pca_sample(processed: pd.DataFrame) -> pd.DataFrame:
+        """Return the one historical PCA fit sample; no prediction-period row is allowed."""
+        fit = processed[processed.factor_date.between(
+            pd.Timestamp(STYLE_PCA_START), pd.Timestamp(STYLE_PCA_END))].copy()
+        if fit.empty:
+            raise ValueError(f"固定PCA拟合区间没有数据：{STYLE_PCA_START} 至 {STYLE_PCA_END}")
+        if fit.factor_date.max() > pd.Timestamp(STYLE_PCA_END):
+            raise AssertionError("固定PCA拟合包含拟合结束日之后的数据")
+        return fit
+
+    def _quarter_context(self, processed: pd.DataFrame, labels: pd.DataFrame,
+                         features: list[str], quarter: pd.Period,
+                         benchmark: pd.Series | None,
+                         pca: FixedPCAStyle) -> dict[str, Any]:
+        """使用同一套历史期固定PCA载荷构造一个预测季度的训练和测试上下文。"""
+        periods = processed.factor_date.dt.to_period("Q")
+
+        # 训练从既定起点开始；多保留预测季度之后20个交易日用于实现样本外标签。
+        quarter_dates = pd.DatetimeIndex(processed.loc[periods == quarter, "factor_date"].unique()).sort_values()
+        if quarter_dates.empty:
+            raise ValueError(f"{quarter}没有预测数据")
+        all_dates = pd.DatetimeIndex(processed.factor_date.drop_duplicates().sort_values())
+        last_position = min(len(all_dates) - 1, all_dates.get_indexer([quarter_dates.max()])[0] + 20)
+        projection_end = all_dates[last_position]
+        projection = processed[
+            (processed.factor_date >= pd.Timestamp(STYLE_TIMING_TRAIN_START)) &
+            (processed.factor_date <= projection_end)]
+        exposure = pca.transform(projection)
+        returns = StyleReturnBuilder().build(exposure, labels, pca.style_names)
+        dates = pd.DatetimeIndex(sorted(exposure.factor_date.unique()))
+        builder = TimingDatasetBuilder()
+        timing = builder.build_features(returns, dates, benchmark).merge(
+            builder.build_labels(returns, dates), on="decision_date", how="left")
+        timing = timing.merge(
+            builder.build_horizon_labels(returns, dates, 5), on="decision_date", how="left")
+        timing = timing.merge(
+            builder.build_horizon_labels(returns, dates, 20), on="decision_date", how="left")
+        timing["momentum_ic_5"] = timing.apply(
+            self._cross_style_ic, axis=1, args=(pca.style_names, 5))
+        timing["momentum_ic_20"] = timing.apply(
+            self._cross_style_ic, axis=1, args=(pca.style_names, 20))
+        timing["information_available"] = (
+            timing.max_information_date.isna() |
+            (timing.max_information_date <= timing.decision_date))
+        if not timing.information_available.all():
+            raise AssertionError("择时特征含未来信息")
+        test = timing[timing.decision_date.dt.to_period("Q") == quarter].copy()
+        if test.empty:
+            raise ValueError(f"{quarter}没有可预测的择时样本")
+        cutoff = test.decision_date.min()
+
+        residual_labeled = projection[projection.factor_date < cutoff].merge(
+            labels.loc[labels.label_exit_date < cutoff,
+                       ["factor_date", "symbol", "label", "label_exit_date"]],
+            on=["factor_date", "symbol"], how="inner", validate="one_to_one").merge(
+            exposure[["factor_date", "symbol", *pca.style_names]],
+            on=["factor_date", "symbol"], how="inner", validate="one_to_one")
+        residual_labeled["residual_label"], residual_audit = self._build_residual_target(
+            residual_labeled, pca.style_names)
+        metadata = {
+            "prediction_quarter": str(quarter),
+            "pca_mode": "fixed_historical_once",
+            "pca_fit_start": STYLE_PCA_START,
+            "pca_fit_end": STYLE_PCA_END,
+        }
+        return {"quarter": quarter, "pca": pca,
+                "exposure": exposure, "returns": returns, "timing": timing,
+                "test": test, "cutoff": cutoff, "residual_labeled": residual_labeled,
+                "residual_audit": residual_audit, "metadata": metadata}
+
     def run(self) -> dict[str, Any]:
         self.logger.status("style_load", .03, "读取因子与价格数据")
         bundle = ExistingDataAdapter().load(STYLE_PCA_START, f"{self.test_year}-12-31")
@@ -258,63 +373,70 @@ class StyleRotationPipeline:
         labels = LabelBuilder().build(bundle.real_twap)
         self.logger.csv("audit/data_quality.csv", bundle.quality)
 
-        self.logger.status("style_preprocess", .12, "检查上游已清洗因子并直接读取")
+        self.logger.status("style_preprocess", .12, "用历史区间拟合一次PCA并冻结载荷")
         processed = CrossSectionalPreprocessor().transform(bundle.factors, features)
-        fit = processed[processed.factor_date.between(STYLE_PCA_START, STYLE_PCA_END)]
-        pca = FixedPCAStyle(self.config.pca_variance, self.config.pca_min_components).fit(fit, features)
-        self.logger.csv("style/pca_loadings.csv", pca.loading_frame())
-        self.logger.json("style/pca_metadata.json", {"fit_start": STYLE_PCA_START, "fit_end": STYLE_PCA_END,
-            "component_count": len(pca.style_names), "target_cumulative_explained_variance": self.config.pca_variance,
-            "achieved_cumulative_explained_variance": pca.cumulative_explained_variance,
-            "explained_variance": pca.explained_variance.tolist(), "component_limit": None})
-
-        self.logger.status("style_returns", .28, "构造风格暴露和可实现风格收益")
-        exposure = pca.transform(processed)
-        returns = StyleReturnBuilder().build(exposure, labels, pca.style_names)
-        self.logger.csv("style/style_returns.csv", returns)
-        dates = pd.DatetimeIndex(sorted(exposure.factor_date.unique()))
+        fit = self._fixed_pca_sample(processed)
+        test_start = pd.Timestamp(f"{self.test_year}-01-01")
+        if fit.factor_date.max() >= test_start:
+            raise AssertionError("固定PCA拟合区间包含测试期数据")
+        pca = FixedPCAStyle(self.config.pca_variance, self.config.pca_min_components).fit(
+            fit, features)
         from env import DATA_DIR
         benchmark = self._benchmark(DATA_DIR / "Benchmark_zz1000.parquet")
-        builder = TimingDatasetBuilder()
-        timing = builder.build_features(returns, dates, benchmark).merge(
-            builder.build_labels(returns, dates), on="decision_date", how="left")
-        timing = timing.merge(builder.build_horizon_labels(returns, dates, 5), on="decision_date", how="left")
-        timing = timing.merge(builder.build_horizon_labels(returns, dates, 20), on="decision_date", how="left")
-        timing["momentum_ic_5"] = timing.apply(self._cross_style_ic, axis=1, args=(pca.style_names, 5))
-        timing["momentum_ic_20"] = timing.apply(self._cross_style_ic, axis=1, args=(pca.style_names, 20))
-        timing["information_available"] = (timing.max_information_date.isna() |
-                                             (timing.max_information_date <= timing.decision_date))
-        if not timing.information_available.all(): raise AssertionError("择时特征含未来信息")
-        self.logger.csv("audit/timing_alignment.csv", timing[["decision_date", "max_information_date", "label_exit_date", "information_available"]])
-        self.logger.csv("audit/momentum_baseline_ic.csv", timing[[
-            "decision_date", "label_exit_date_5", "label_exit_date_20",
-            "momentum_ic_5", "momentum_ic_20"]])
+        quarters = list(pd.period_range(f"{self.test_year}Q1", f"{self.test_year}Q4", freq="Q"))
+        contexts = {}
+        for position, quarter in enumerate(quarters):
+            self.logger.status("style_returns", .18 + .12 * position,
+                               f"{quarter}：沿用固定PCA载荷构造滚动训练样本")
+            contexts[quarter] = self._quarter_context(
+                processed, labels, features, quarter, benchmark, pca)
+        pca_style_daily, pca_style_summary = self._pca_style_rankic(
+            contexts, labels, pca.style_names)
+        self.logger.csv("style/pca_loadings.csv", pca.loading_frame())
+        self.logger.json("style/pca_metadata.json", {
+            "mode": "fixed_historical_once",
+            "fit_start": str(fit.factor_date.min().date()),
+            "fit_end": str(fit.factor_date.max().date()),
+            "fit_trading_days": int(fit.factor_date.nunique()),
+            "aggregation": "mean_daily_cross_sectional_correlation",
+            "component_count": len(pca.style_names),
+            "target_cumulative_explained_variance": self.config.pca_variance,
+            "achieved_cumulative_explained_variance": pca.cumulative_explained_variance,
+            "explained_variance": pca.explained_variance.tolist(),
+            "quarters": [context["metadata"] for context in contexts.values()]})
+        self.logger.csv("style/style_returns.csv", pd.concat(
+            [context["returns"] for context in contexts.values()], ignore_index=True
+        ).drop_duplicates("factor_date").sort_values("factor_date"))
+        self.logger.csv("audit/timing_alignment.csv", pd.concat([
+            context["timing"][["decision_date", "max_information_date", "label_exit_date",
+                               "information_available"]]
+            for context in contexts.values()], ignore_index=True
+        ).drop_duplicates("decision_date").sort_values("decision_date"))
+        self.logger.csv("audit/momentum_baseline_ic.csv", pd.concat([
+            context["timing"][["decision_date", "label_exit_date_5", "label_exit_date_20",
+                               "momentum_ic_5", "momentum_ic_20"]].assign(
+                                   prediction_quarter=str(quarter))
+            for quarter, context in contexts.items()], ignore_index=True))
+        self.logger.csv("audit/residual_target_orthogonality.csv", pd.concat([
+            context["residual_audit"].assign(prediction_quarter=str(quarter))
+            for quarter, context in contexts.items()], ignore_index=True))
 
-        # 仅保留滚动训练所需区间；标签退出日必须早于每个季度的预测起点。
-        residual_labeled = processed[processed.factor_date >= pd.Timestamp(STYLE_TIMING_TRAIN_START)].merge(
-            labels[["factor_date", "symbol", "label", "label_exit_date"]],
-            on=["factor_date", "symbol"], how="inner", validate="one_to_one").merge(
-            exposure[["factor_date", "symbol", *pca.style_names]],
-            on=["factor_date", "symbol"], how="inner", validate="one_to_one")
-        residual_labeled["residual_label"], residual_target_audit = self._build_residual_target(
-            residual_labeled, pca.style_names)
-        self.logger.csv("audit/residual_target_orthogonality.csv", residual_target_audit)
-        predictions, weight_frames, training_rows, retain_frames, vote_frames = [], [], [], [], []
+        predictions, weight_frames, training_rows, vote_frames = [], [], [], []
         residual_coefficients = []
         xgb_feature_importance = []
         style_forecast_audit = []
-        test_dates = timing.decision_date.dt.year.eq(self.test_year)
         for model_name in self.models:
             output_name = "style_rotation" if model_name == "xgboost_dual_horizon" else f"style_{model_name}"
             model_weights = []
             if model_name == "xgboost_dual_horizon":
-                model_scores, model_retain, model_votes = [], [], []
+                model_scores, model_votes = [], []
                 # 20日隔离只用于首次（2022—2023）参数选择；2024各季度固定树数，
                 # 用截止当季前全部已实现标签重训，不再重复损失20个交易日样本。
                 xgb_selection: dict[int, dict[str, Any]] = {}
                 forecast_ic_history: list[pd.DataFrame] = []
-                for quarter, test in timing[test_dates].groupby(timing.loc[test_dates, "decision_date"].dt.to_period("Q")):
-                    cutoff = test.decision_date.min()
+                for quarter, context in contexts.items():
+                    pca, timing, test, cutoff = (context["pca"], context["timing"],
+                                                  context["test"], context["cutoff"])
                     train5 = timing[(timing.decision_date >= STYLE_TIMING_TRAIN_START) &
                                     (timing.label_exit_date_5 < cutoff) &
                                     timing[f"target_{pca.style_names[0]}_5"].notna()].copy()
@@ -382,14 +504,13 @@ class StyleRotationPipeline:
                     forecast = combined[["decision_date"]].copy()
                     for style in pca.style_names:
                         forecast[style] = combined.weight_5 * combined[f"{style}_5"] + combined.weight_20 * combined[f"{style}_20"]
-                    quarter_exposure = exposure[exposure.factor_date.isin(test.decision_date)]
-                    score, retain, votes = self._consensus_stock_scores(
+                    quarter_exposure = context["exposure"][
+                        context["exposure"].factor_date.isin(test.decision_date)]
+                    score, votes = self._consensus_stock_scores(
                         quarter_exposure, forecast, pca.style_names,
-                        self.config.buy_confirmations, self.config.sell_confirmations,
-                        self.config.vote_quantile)
-                    residual_train = residual_labeled[
-                        (residual_labeled.factor_date >= pd.Timestamp(STYLE_TIMING_TRAIN_START)) &
-                        (residual_labeled.label_exit_date < cutoff) & residual_labeled.residual_label.notna()].copy()
+                        self.config.buy_confirmations, self.config.vote_quantile)
+                    residual_train = context["residual_labeled"][
+                        context["residual_labeled"].residual_label.notna()].copy()
                     age = (cutoff - residual_train.factor_date).dt.days / 365.25 * 252
                     residual_train["sample_weight"] = np.exp(
                         -np.log(2) * age / STYLE_TIME_DECAY_HALFLIFE).astype(np.float32)
@@ -406,11 +527,17 @@ class StyleRotationPipeline:
                     score["prediction"] = self._combine_style_residual(
                         score.style_timing_score, score.residual_prediction_score,
                         self.config.residual_weight)
+                    score = score.merge(
+                        votes[["factor_date", "symbol", "buy_votes", "sell_votes", "buy_eligible"]],
+                        on=["factor_date", "symbol"], how="left", validate="one_to_one")
+                    risk = dynamic[["decision_date", "risk_off"]].rename(
+                        columns={"decision_date": "factor_date"})
+                    score = score.merge(risk, on="factor_date", how="left", validate="many_to_one")
                     coefficient = residual_model.coefficient_frame(features)
                     coefficient["quarter"] = str(quarter)
                     coefficient["train_end"] = residual_model.max_label_exit_date_
                     residual_coefficients.append(coefficient)
-                    model_scores.append(score); model_retain.append(retain); model_votes.append(votes)
+                    model_scores.append(score); model_votes.append(votes)
                     dynamic["model"] = output_name; model_weights.append(dynamic)
                     training_rows.append({"model": output_name, "quarter": str(quarter),
                         "train_end": str(max(train5.label_exit_date_5.max(), train20.label_exit_date_20.max())),
@@ -442,12 +569,13 @@ class StyleRotationPipeline:
                 score = pd.concat(model_scores, ignore_index=True)
                 score = score.merge(labels[["factor_date", "symbol", "label"]], on=["factor_date", "symbol"], how="left")
                 score["model"] = output_name; predictions.append(score)
-                retain = pd.concat(model_retain, ignore_index=True); retain["model"] = output_name; retain_frames.append(retain)
                 votes = pd.concat(model_votes, ignore_index=True); votes["model"] = output_name; vote_frames.append(votes)
                 weight_frames.append(pd.concat(model_weights, ignore_index=True))
                 continue
-            for quarter, test in timing[test_dates].groupby(timing.loc[test_dates, "decision_date"].dt.to_period("Q")):
-                cutoff = test.decision_date.min()
+            model_scores = []
+            for quarter, context in contexts.items():
+                pca, timing, test, cutoff = (context["pca"], context["timing"],
+                                              context["test"], context["cutoff"])
                 train = timing[(timing.label_exit_date < cutoff) & timing.best_style.notna()].copy()
                 age = (cutoff - train.decision_date).dt.days / 365.25 * 252
                 train["sample_weight"] = np.exp(-np.log(2) * age / STYLE_TIME_DECAY_HALFLIFE) * (1 + train.winner_margin.clip(lower=0))
@@ -456,14 +584,16 @@ class StyleRotationPipeline:
                 model_weights.append(weight)
                 training_rows.append({"model": output_name, "quarter": str(quarter), "train_end": str(train.label_exit_date.max()),
                                       "train_samples": len(train), "test_days": len(test)})
-            weights = pd.concat(model_weights, ignore_index=True)
-            weights["model"] = output_name; weight_frames.append(weights)
-            score = self._stock_scores(exposure, weights.drop(columns="model"), pca.style_names)
+                quarter_exposure = context["exposure"][
+                    context["exposure"].factor_date.isin(test.decision_date)]
+                model_scores.append(self._stock_scores(quarter_exposure, weight, pca.style_names))
+            weights = pd.concat(model_weights, ignore_index=True); weights["model"] = output_name
+            weight_frames.append(weights)
+            score = pd.concat(model_scores, ignore_index=True)
             score = score.merge(labels[["factor_date", "symbol", "label"]], on=["factor_date", "symbol"], how="left")
             score["model"] = output_name; predictions.append(score)
         prediction = pd.concat(predictions, ignore_index=True)
         weights = pd.concat(weight_frames, ignore_index=True)
-        retain_signals = pd.concat(retain_frames, ignore_index=True) if retain_frames else pd.DataFrame()
         vote_audit = pd.concat(vote_frames, ignore_index=True) if vote_frames else pd.DataFrame()
         daily = pd.concat([daily_ic(g).assign(model=m) for m, g in prediction.groupby("model")], ignore_index=True)
         component_daily_frame = self._component_daily_metrics(prediction)
@@ -488,7 +618,6 @@ class StyleRotationPipeline:
             factor_file.to_parquet(target)
         self.logger.csv("timing/style_weights.csv", weights)
         self.logger.csv("timing/consensus_votes.csv", vote_audit)
-        self.logger.csv("audit/retain_signals.csv", retain_signals)
         self.logger.csv("style/residual_ridge_coefficients.csv",
                         pd.concat(residual_coefficients, ignore_index=True) if residual_coefficients else pd.DataFrame())
         self.logger.csv("timing/xgb_feature_importance.csv",
@@ -499,8 +628,11 @@ class StyleRotationPipeline:
                         if style_forecast_audit else pd.DataFrame())
         self.logger.csv("metrics/daily_rankic.csv", daily)
         self.logger.csv("metrics/score_component_rankic.csv", component_daily_frame)
+        self.logger.csv("metrics/pca_style_daily_rankic.csv", pca_style_daily)
+        self.logger.csv("metrics/pca_style_rankic.csv", pca_style_summary)
         self.logger.csv("metrics/summary.csv", summary)
         self.logger.csv("metrics/training_records.csv", training_frame)
         return {"predictions": prediction, "daily_metrics": daily, "summary": summary,
                 "training_records": training_frame, "weights": weights,
-                "retain_signals": retain_signals, "vote_audit": vote_audit}
+                "vote_audit": vote_audit,
+                "pca_style_metrics": pca_style_summary}
