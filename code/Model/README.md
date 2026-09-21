@@ -35,10 +35,10 @@ code/Model/
 real_twap = adjusted_twap / accum_adj_factor
 ```
 
-因子日在 `t0` 收盘后产生特征；`t1` 用TWAP买入；`t2` 用TWAP卖出。因此保存在 `t0` 的标签是：
+因子日在 `t0` 收盘后产生特征；下一交易日用TWAP买入并作为 `t1` 退出。因此保存在 `t0` 的标签是：
 
 ```python
-label_t0 = real_twap_t2 / real_twap_t1 - 1
+label_t0 = real_twap_t1 / real_twap_t0 - 1
 ```
 
 即宽表的：

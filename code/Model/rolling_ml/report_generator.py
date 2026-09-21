@@ -54,11 +54,13 @@ class ReportGenerator:
         daily_fig = go.Figure()
         cumulative_fig = go.Figure()
         quarterly_fig = go.Figure()
-        for model, group in daily_metrics.sort_values("factor_date").groupby("model") if not daily_metrics.empty else []:
-            daily_fig.add_scatter(x=group.factor_date, y=group.rank_ic, name=model)
-            cumulative_fig.add_scatter(x=group.factor_date, y=group.rank_ic.fillna(0).cumsum(), name=model)
+        daily_groups = (["model", "pool"] if "pool" in daily_metrics.columns else ["model"])
+        for keys, group in daily_metrics.sort_values("factor_date").groupby(daily_groups) if not daily_metrics.empty else []:
+            label = "-".join(keys) if isinstance(keys, tuple) else keys
+            daily_fig.add_scatter(x=group.factor_date, y=group.rank_ic, name=label)
+            cumulative_fig.add_scatter(x=group.factor_date, y=group.rank_ic.fillna(0).cumsum(), name=label)
             quarter = group.assign(quarter=group.factor_date.dt.to_period("Q").astype(str)).groupby("quarter").rank_ic.mean()
-            quarterly_fig.add_scatter(x=quarter.index, y=quarter.values, name=model, mode="lines+markers")
+            quarterly_fig.add_scatter(x=quarter.index, y=quarter.values, name=label, mode="lines+markers")
         daily_fig.update_layout(title="每日RankIC", template="plotly_white")
         cumulative_fig.update_layout(title="每日RankIC累计和", template="plotly_white")
         quarterly_fig.update_layout(title="最终股票分数季度Mean RankIC", template="plotly_white")
@@ -67,19 +69,23 @@ class ReportGenerator:
         style_columns = {"train_rank_ic_5", "oos_style_rank_ic_5",
                          "train_rank_ic_20", "oos_style_rank_ic_20"}
         if not training_records.empty and style_columns.issubset(training_records.columns):
-            ordered = training_records.sort_values(["model", "quarter"])
-            for model, group in ordered.groupby("model"):
+            group_columns = ["model", "pool"] if "pool" in training_records.columns else ["model"]
+            ordered = training_records.sort_values([*group_columns, "quarter"])
+            for keys, group in ordered.groupby(group_columns):
+                label = "-".join(keys) if isinstance(keys, tuple) else keys
                 for horizon in (5, 20):
                     for column, scope in ((f"train_rank_ic_{horizon}", "训练"),
                                           (f"oos_style_rank_ic_{horizon}", "样本外")):
                         style_generalization_fig.add_scatter(
-                            x=group.quarter, y=group[column], name=f"{model} {horizon}日{scope}",
+                            x=group.quarter, y=group[column], name=f"{label} {horizon}日{scope}",
                             mode="lines+markers")
         if not pca_style_metrics.empty:
-            for style, group in pca_style_metrics.sort_values("quarter").groupby("style"):
+            group_columns = ["pool", "style"] if "pool" in pca_style_metrics.columns else ["style"]
+            for keys, group in pca_style_metrics.sort_values("quarter").groupby(group_columns):
+                label = "-".join(keys) if isinstance(keys, tuple) else keys
                 style_generalization_fig.add_scatter(
                     x=group.quarter, y=group.mean_rank_ic,
-                    name=f"PCA {style} 股票RankIC", mode="lines+markers")
+                    name=f"PCA {label} 股票RankIC", mode="lines+markers")
         style_generalization_fig.update_layout(
             title="风格模型拟合/调参与PCA成分股票RankIC",
             template="plotly_white")

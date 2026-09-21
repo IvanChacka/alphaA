@@ -2,7 +2,8 @@ from imports import *
 from env import INDUSTRY_DATA_CANDIDATES, OPTIMIZER_NAMES
 from optimizers.base import NoOptimizer, ScoreOptimizer
 from optimizers.industry_neutral import IndustryNeutralOptimizer
-from optimizers.turnover import LazyTurnoverOptimizer, NoTurnoverOptimizer
+from optimizers.turnover import (LazyTurnoverOptimizer, NoTurnoverOptimizer,
+                                 TurnoverLimitOptimizer)
 from optimizers.drawdown import NoDrawdownOptimizer, QuadraticDrawdownOptimizer
 
 
@@ -26,6 +27,8 @@ def create_turnover_optimizer(name: str, sell_confirmations: int = 2,
                               max_turnover_ratio: float = .30):
     if name == "none":
         return NoTurnoverOptimizer()
+    if name == "turnover_limit":
+        return TurnoverLimitOptimizer(max_turnover_ratio)
     if name == "lazy_turnover":
         return LazyTurnoverOptimizer(sell_confirmations, max_turnover_ratio)
     raise ValueError(f"未知换手率优化器：{name}")

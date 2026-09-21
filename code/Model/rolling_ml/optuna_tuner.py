@@ -1,17 +1,17 @@
 from imports import *
 from env import OPTUNA_N_JOBS, OPTUNA_N_STARTUP_TRIALS, OPTUNA_N_TRIALS, OPTUNA_SEED, XGB_N_ESTIMATORS
-from rolling_ml.metrics import metric_summary
+from rolling_ml.metrics import metric_summary, model_selection_score
 from rolling_ml.models.xgb_model import XGBoostModel
 from rolling_ml.preprocessing import FeaturePreprocessor
 
 
 class XGBoostTuner:
-    """年度TPE调参；SQLite持久化，全年只调用一次。"""
+    """TPE tuning with an isolated persistent study for each requested window."""
 
     def __init__(self, run_root: Path, n_trials: int = OPTUNA_N_TRIALS, progress=None, status=None):
         self.root, self.n_trials, self.progress, self.status = Path(run_root), n_trials, progress, status
 
-    def tune(self, data: pd.DataFrame, features: list[str], folds, year: int = 2024) -> dict:
+    def tune(self, data: pd.DataFrame, features: list[str], folds, year: int | str = 2024) -> dict:
         if optuna is None or XGBRegressor is None:
             raise ImportError("XGBoost调参需要安装 optuna 和 xgboost")
         optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -43,21 +43,27 @@ class XGBoostTuner:
                     prep = FeaturePreprocessor(scale=False)
                     x_train = prep.fit_transform(FeaturePreprocessor.cross_sectional(train, features))
                     x_valid = prep.transform(FeaturePreprocessor.cross_sectional(valid, features))
-                    model = XGBoostModel(params).fit(x_train, train.label, x_valid, valid.label)
+                    # Optuna's objective is RankIC. Loss-based early stopping can select
+                    # iteration zero and collapse the final model to one tree, so every
+                    # trial uses the same complete boosting budget here.
+                    model = XGBoostModel({**params, "n_estimators": XGB_N_ESTIMATORS}).fit(
+                        x_train, train.label)
                     valid_eval = valid[["factor_date", "symbol", "label"]].copy()
                     valid_eval["prediction"] = model.predict(x_valid)
                     train_eval = train[["factor_date", "symbol", "label"]].copy()
                     train_eval["prediction"] = model.predict(x_train)
                     valid_metric, train_metric = metric_summary(valid_eval), metric_summary(train_eval)
-                    validation_scores.append(valid_metric["mean_rank_ic"])
+                    validation_scores.append(model_selection_score(valid_metric))
                     training_scores.append(train_metric["mean_rank_ic"])
-                    best_iterations.append(model.best_iteration)
+                    best_iterations.append(XGB_N_ESTIMATORS - 1)
                     evaluated_folds.append(valid_eval)
                     fold_records.append({"trial_number": trial.number, "fold": name,
-                        "rank_ic": valid_metric["mean_rank_ic"], "icir": valid_metric["icir"],
+                        "rank_ic": valid_metric["mean_rank_ic"], "pearson_ic": valid_metric.get("pearson_ic"),
+                        "top_bottom_return": valid_metric.get("top_bottom_return"),
+                        "selection_score": validation_scores[-1], "icir": valid_metric["icir"],
                         "train_rank_ic": train_metric["mean_rank_ic"], "train_samples": len(train),
                         "valid_samples": len(valid), "feature_count": len(features),
-                        "best_iteration": model.best_iteration})
+                        "best_iteration": XGB_N_ESTIMATORS - 1})
                     del x_train, x_valid, model, train_eval, valid_eval
                     gc.collect()
                 combined = metric_summary(pd.concat(evaluated_folds, ignore_index=True))
@@ -68,7 +74,10 @@ class XGBoostTuner:
                 trial.set_user_attr("duration_seconds", time.time() - started)
                 for index, score in enumerate(validation_scores, 1):
                     trial.set_user_attr(f"fold_{index}_rank_ic", float(score))
-                return float(combined["mean_rank_ic"])
+                selection_score = float(np.nanmean(validation_scores))
+                trial.set_user_attr("selection_score", selection_score)
+                trial.set_user_attr("mean_rank_ic", float(combined["mean_rank_ic"]))
+                return selection_score
             except Exception as exc:
                 trial.set_user_attr("exception", f"{type(exc).__name__}: {exc}")
                 raise
@@ -96,10 +105,7 @@ class XGBoostTuner:
             self.root / f"{year}_top20_trials.csv", index=False, encoding="utf-8-sig")
         fold_frame = pd.DataFrame(fold_records)
         best_folds = fold_frame[fold_frame.trial_number == study.best_trial.number]
-        stored_iteration = study.best_trial.user_attrs.get("best_iteration")
-        best_iteration = (int(np.nanmedian(best_folds.best_iteration)) + 1 if not best_folds.empty
-                          else int(stored_iteration) + 1 if stored_iteration is not None else XGB_N_ESTIMATORS)
-        best_iteration = min(best_iteration, XGB_N_ESTIMATORS)
+        best_iteration = XGB_N_ESTIMATORS
         best_params = {**study.best_params, "n_estimators": best_iteration}
         for name, value in [("best_params", best_params), ("best_iterations", {"n_estimators": best_iteration})]:
             (self.root / f"{year}_{name}.json").write_text(json.dumps(value, indent=2), encoding="utf-8")

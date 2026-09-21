@@ -6,8 +6,16 @@ from dataclasses import replace
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
+import sys
 import threading
 from urllib.parse import parse_qs, urlparse
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+BACKTEST_DIR = PROJECT_ROOT / "code" / "BackTest"
+if BACKTEST_DIR.exists():
+    BACKTEST_DIR_STR = str(BACKTEST_DIR)
+    if BACKTEST_DIR_STR not in sys.path:
+        sys.path.insert(0, BACKTEST_DIR_STR)
 
 from backtest import BacktestEngine
 from config import BacktestConfig, MARKETS, ROOT

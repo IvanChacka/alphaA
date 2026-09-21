@@ -3,21 +3,149 @@ import sys
 
 import numpy as np
 import pandas as pd
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from style_rotation.pca_style import FixedPCAStyle, varimax
 from style_rotation.pipeline import StyleRotationPipeline
-from style_rotation.models import DualHorizonXGBoost
+from style_rotation.config import StyleRuntimeConfig
+from style_rotation.models import DualHorizonXGBoost, PCAStockXGBoost, PCAStockXGBoostTuner
 from style_rotation.residual_model import ResidualRidge
 from style_rotation.style_returns import StyleReturnBuilder
 from style_rotation.timing import TimingDatasetBuilder
+
+
+def test_style_runtime_config_accepts_auditable_xgb_depth():
+    assert StyleRuntimeConfig(xgb_max_depth=4).validate().xgb_max_depth == 4
+    assert StyleRuntimeConfig(rotation_quantile=.10,
+                              rebalance_frequency="monthly").validate().rebalance_frequency == "monthly"
+    assert StyleRuntimeConfig(rebalance_frequency="quarterly").validate().rebalance_frequency == "quarterly"
+    with pytest.raises(ValueError, match="调仓频率"):
+        StyleRuntimeConfig(rebalance_frequency="yearly").validate()
+
+
+def test_pca_stock_xgboost_uses_exposures_and_purged_validation(monkeypatch):
+    monkeypatch.setattr("style_rotation.models.STYLE_XGB_MAX_ESTIMATORS", 12)
+    monkeypatch.setattr("style_rotation.models.STYLE_XGB_EARLY_STOPPING_ROUNDS", 3)
+    monkeypatch.setattr("style_rotation.models.STYLE_XGB_VALIDATION_EMBARGO_DAYS", 4)
+    rng = np.random.default_rng(71)
+    rows = []
+    for date in pd.date_range("2022-01-03", periods=40, freq="B"):
+        for stock in range(12):
+            values = rng.normal(size=3)
+            rows.append({"factor_date": date, "symbol": f"{stock:06d}",
+                         "style_1": values[0], "style_2": values[1],
+                         "style_3": values[2],
+                         "label": values[0] - .4 * values[1] + rng.normal(scale=.1),
+                         "sample_weight": 1.0})
+    frame = pd.DataFrame(rows)
+    frame.loc[0, "label"] = np.nan
+    model = PCAStockXGBoost(
+        ["style_1", "style_2", "style_3"], {"max_depth": 2}).fit(frame)
+
+    assert len(model.predict(frame.head(7))) == 7
+    assert set(model.feature_importance_frame().feature) == {
+        "style_1", "style_2", "style_3"}
+    assert model.best_trees >= 1
+    assert model.fit_end_ < model.validation_start_
+    business_gap = len(pd.bdate_range(model.fit_end_, model.validation_start_)) - 1
+    assert business_gap >= model.embargo_days_
+
+
+def test_pca_xgb_optuna_split_drops_nonfinite_labels():
+    dates = pd.date_range("2022-01-03", periods=30, freq="B")
+    frame = pd.DataFrame({"factor_date": dates, "symbol": ["000001"] * len(dates),
+                          "style_1": 1.0, "label": 0.1, "sample_weight": 1.0})
+    frame.loc[0, "label"] = np.nan
+
+    fit, valid = PCAStockXGBoostTuner._split(frame, embargo_days=4)
+
+    assert fit.label.notna().all() and valid.label.notna().all()
+
+
+def test_pca_xgb_default_split_has_no_fixed_embargo_and_purges_by_label_exit():
+    dates = pd.date_range("2022-01-31", periods=5, freq="ME")
+    frame = pd.DataFrame({"factor_date": dates, "symbol": "000001",
+                          "style_1": 1.0, "label": np.arange(len(dates)),
+                          "sample_weight": 1.0,
+                          "label_exit_date": dates.to_series().shift(-1).to_numpy()})
+
+    fit, valid = PCAStockXGBoostTuner._split(frame)
+
+    assert valid.factor_date.min() == dates[4]
+    assert fit.factor_date.max() == dates[2]
+    assert (fit.label_exit_date < valid.factor_date.min()).all()
+
+
+def test_pca_stock_xgb_uses_no_unrequested_fixed_embargo():
+    assert PCAStockXGBoost(["style_1"]).embargo_days_ == 0
+
+
+def test_pca_xgb_converts_twenty_trading_day_embargo_for_monthly_factors():
+    dates = pd.date_range("2009-04-30", periods=9, freq="ME")
+    frame = pd.DataFrame({"factor_date": dates, "symbol": "000001",
+                          "style_1": 1.0, "label": np.arange(len(dates)),
+                          "sample_weight": 1.0})
+
+    fit, valid = PCAStockXGBoostTuner._split(frame, embargo_days=20)
+
+    omitted = dates[(dates > fit.factor_date.max()) &
+                    (dates < valid.factor_date.min())]
+    assert len(omitted) == 1
+    assert len(valid.factor_date.unique()) >= 1
+
+
+def test_pca_confidence_gate_holds_then_liquidates_after_two_bad_windows():
+    dates = pd.date_range("2024-01-02", periods=25, freq="B")
+    rows = []
+    for position, date in enumerate(dates):
+        exit_date = dates[min(position + 1, len(dates) - 1)]
+        for value, symbol in enumerate(["000001", "000002", "000003"], 1):
+            rows.append({"factor_date": date, "symbol": symbol,
+                         "prediction": float(value), "label": float(4 - value),
+                         "label_exit_date": exit_date, "pool": "A500"})
+    predictions = pd.DataFrame(rows)
+    training = pd.DataFrame([{"pool": "A500", "quarter": "2024Q1",
+                              "validation_rank_ic": .10}])
+    metadata = {pd.Period("2024Q1", freq="Q"): {
+        "cumulative_explained_variance": .95,
+        "alignment": [{"signed_similarity": .90}]}}
+    config = StyleRuntimeConfig(confidence_rankic_window=10, entry_rank=2,
+                                exit_rank=3)
+    gated, audit = StyleRotationPipeline(None, config=config)._apply_pca_confidence_gate(
+        predictions, training, metadata)
+
+    pd.testing.assert_series_equal(gated.prediction, predictions.prediction)
+    assert set(audit["mode"]) == {"normal", "hold", "risk_off_liquidate"}
+    hold_date = audit.loc[audit["mode"] == "hold", "factor_date"].iloc[0]
+    held = gated[gated.factor_date == hold_date]
+    assert held.trade_prediction.isna().all() and held.retain.all()
+    risk_date = audit.loc[audit["mode"] == "risk_off_liquidate", "factor_date"].iloc[0]
+    risk = gated[gated.factor_date == risk_date]
+    assert risk.trade_prediction.isna().all() and not risk.retain.any()
 
 
 def test_varimax_is_orthogonal():
     raw = np.random.default_rng(7).normal(size=(30, 6))
     _, rotation, _ = varimax(raw)
     assert np.allclose(rotation.T @ rotation, np.eye(6), atol=1e-6)
+
+
+def test_pca_alignment_reorders_and_signs_components():
+    reference = FixedPCAStyle()
+    current = FixedPCAStyle()
+    reference.features = current.features = ["f0", "f1", "f2"]
+    reference.loadings = np.eye(3)
+    current.loadings = reference.loadings[:, [2, 0, 1]] * np.array([-1.0, 1.0, -1.0])
+    reference.explained_variance = np.array([.5, .3, .2])
+    current.explained_variance = np.array([.2, .5, .3])
+    reference.rotation = current.rotation = np.eye(3)
+
+    mapping = current.align_to(reference)
+
+    assert np.allclose(current.loadings, reference.loadings)
+    assert mapping.source_component.tolist() == [2, 3, 1]
 
 
 def test_fixed_pca_transform_does_not_refit():
@@ -174,6 +302,22 @@ def test_component_ic_uses_same_final_candidate_universe():
     assert all_market.stock_count.eq(4).all()
 
 
+def test_point_in_time_pool_filter_uses_each_dates_membership():
+    dates = pd.to_datetime(["2024-01-02", "2024-01-03"])
+    frame = pd.DataFrame({
+        "factor_date": [dates[0], dates[0], dates[1], dates[1]],
+        "symbol": ["000001", "000002", "000001", "000002"],
+        "factor": [1.0, 2.0, 3.0, 4.0],
+    })
+    membership = pd.DataFrame(
+        [[True, False], [False, True]], index=dates, columns=["000001", "000002"])
+
+    selected = StyleRotationPipeline._inside_pool(frame, membership)
+
+    assert list(zip(selected.factor_date, selected.symbol)) == [
+        (dates[0], "000001"), (dates[1], "000002")]
+
+
 def test_residual_target_is_orthogonal_to_style_exposures():
     rng = np.random.default_rng(31)
     rows = 100
@@ -198,6 +342,31 @@ def test_residual_ridge_records_realized_label_boundary():
     assert model.max_label_exit_date_ == frame.label_exit_date.max()
 
 
+def test_residual_validation_disables_regime_reversed_increment():
+    rng = np.random.default_rng(71)
+    dates = pd.date_range("2020-01-02", periods=100, freq="B")
+    features = [f"f{i}" for i in range(4)]
+    rows = []
+    for position, date in enumerate(dates):
+        values = rng.normal(size=(20, len(features)))
+        direction = 1.0 if position < 80 else -1.0
+        for symbol, vector in enumerate(values):
+            rows.append({"factor_date": date, "symbol": f"{symbol:06d}",
+                         **dict(zip(features, vector)),
+                         "residual_label": direction * vector[1],
+                         "sample_weight": 1.0})
+    frame = pd.DataFrame(rows)
+    pca = FixedPCAStyle()
+    pca.features = features
+    pca.loadings = np.eye(len(features))[:, :1]
+    pipeline = StyleRotationPipeline(None, config=StyleRuntimeConfig(residual_weight=.8))
+
+    result = pipeline._validated_residual_weight(frame, pca, features)
+
+    assert result["rank_ic"] < 0
+    assert result["weight"] == 0.0
+
+
 def test_training_forecast_ic_is_reported():
     dates = pd.date_range("2023-01-02", periods=4, freq="B")
     styles = ["style_1", "style_2", "style_3"]
@@ -217,6 +386,15 @@ def test_style_xgb_validation_has_twenty_trading_day_embargo():
     assert fit.decision_date.max() == dates[59]
     omitted = dates[(dates > fit.decision_date.max()) & (dates < valid.decision_date.min())]
     assert len(omitted) == 20
+
+
+def test_style_xgb_converts_embargo_for_monthly_observations():
+    dates = pd.date_range("2022-01-31", periods=12, freq="ME")
+    frame = pd.DataFrame({"decision_date": dates})
+    fit, valid = DualHorizonXGBoost._purged_time_split(frame, embargo_days=20)
+    omitted = dates[(dates > fit.decision_date.max()) &
+                    (dates < valid.decision_date.min())]
+    assert len(omitted) == 1
 
 
 def test_style_xgb_uses_one_shared_long_table_for_all_target_styles():
@@ -284,12 +462,32 @@ def test_negative_realized_xgb_icir_disables_both_horizons_without_future_data()
     assert np.isclose(result.loc[0, "weight_5"] + result.loc[0, "weight_20"], 1.0)
 
 
-def test_fixed_pca_sample_is_fitted_once_on_historical_window():
-    frame = pd.DataFrame({
-        "factor_date": pd.to_datetime(["2019-12-31", "2020-01-02", "2021-12-31",
-                                        "2022-01-04", "2024-03-29"]),
-        "symbol": ["000001"] * 5, "f0": np.arange(5, dtype=float),
+def test_rolling_pca_uses_two_prior_quarters_and_aligns_components():
+    rng = np.random.default_rng(101)
+    rows = []
+    dates = pd.to_datetime(["2021-07-01", "2021-10-01", "2022-01-04", "2022-04-01"])
+    for date in dates:
+        for symbol in range(20):
+            rows.append([date, f"{symbol:06d}", *rng.normal(size=6)])
+    frame = pd.DataFrame(rows, columns=["factor_date", "symbol", *[f"f{i}" for i in range(6)]])
+    pipeline = StyleRotationPipeline(None)
+    pcas, metadata = pipeline._rolling_pcas(
+        frame, [f"f{i}" for i in range(6)],
+        [pd.Period("2022Q1", freq="Q"), pd.Period("2022Q2", freq="Q")])
+
+    assert metadata[pd.Period("2022Q1", freq="Q")]["fit_quarters"] == ["2021Q3", "2021Q4"]
+    assert pd.Timestamp(metadata[pd.Period("2022Q1", freq="Q")]["fit_end"]) < pd.Timestamp("2022-01-01")
+    assert metadata[pd.Period("2022Q2", freq="Q")]["fit_quarters"] == ["2021Q4", "2022Q1"]
+    assert len(metadata[pd.Period("2022Q2", freq="Q")]["alignment"]) == len(pcas[pd.Period("2022Q2", freq="Q")].style_names)
+    assert np.isfinite(pcas[pd.Period("2022Q1", freq="Q")].loadings).all()
+
+
+def test_rolling_pca_starts_after_first_complete_lookback_window():
+    processed = pd.DataFrame({"factor_date": pd.to_datetime([
+        "2020-01-02", "2020-04-01", "2020-07-01", "2020-10-09"])
     })
-    fit = StyleRotationPipeline._fixed_pca_sample(frame)
-    assert set(fit.factor_date) == {pd.Timestamp("2020-01-02"), pd.Timestamp("2021-12-31")}
-    assert fit.factor_date.max() < pd.Timestamp("2022-01-01")
+
+    quarters = StyleRotationPipeline._eligible_pca_quarters(
+        processed, pd.Period("2020Q1", freq="Q"), pd.Period("2020Q4", freq="Q"))
+
+    assert quarters == [pd.Period("2020Q3", freq="Q"), pd.Period("2020Q4", freq="Q")]

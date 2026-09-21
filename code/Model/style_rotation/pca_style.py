@@ -21,7 +21,7 @@ def varimax(loadings: np.ndarray, gamma: float = 1.0, max_iter: int = 200,
 
 
 class FixedPCAStyle:
-    """以历史日截面相关矩阵的时间均值拟合一次，并永久冻结旋转载荷。"""
+    """以一个历史窗口拟合PCA，并冻结该窗口的旋转载荷。"""
 
     def __init__(self, explained_variance: float = STYLE_EXPLAINED_VARIANCE,
                  min_components: int = STYLE_MIN_COMPONENTS):
@@ -36,7 +36,8 @@ class FixedPCAStyle:
         self.explained_variance: np.ndarray | None = None
         self.rotation: np.ndarray | None = None
 
-    def fit(self, frame: pd.DataFrame, features: list[str]):
+    def fit(self, frame: pd.DataFrame, features: list[str],
+            component_count: int | None = None):
         correlations = []
         for _, group in frame.groupby("factor_date", sort=True):
             x = group[features].to_numpy(dtype=np.float64)
@@ -54,8 +55,8 @@ class FixedPCAStyle:
         order = np.argsort(values)[::-1]
         values, vectors = np.maximum(values[order], 0), vectors[:, order]
         ratio = values / values.sum()
-        k = int(np.searchsorted(np.cumsum(ratio), self.explained_variance_target) + 1)
-        # 不再设置成分数上限：唯一上限是原始因子数。
+        target_k = int(np.searchsorted(np.cumsum(ratio), self.explained_variance_target) + 1)
+        k = target_k if component_count is None else int(component_count)
         k = min(max(self.min_components, k), len(features))
         rotated, rotation, _ = varimax(vectors[:, :k] * np.sqrt(values[:k]))
         # 最大绝对载荷为正，消除特征向量符号不确定性。
@@ -65,6 +66,37 @@ class FixedPCAStyle:
         self.features, self.loadings = list(features), rotated
         self.explained_variance, self.rotation = ratio[:k], rotation
         return self
+
+    def align_to(self, reference: "FixedPCAStyle") -> pd.DataFrame:
+        """按载荷相似度对齐新窗口成分，避免跨季度直接拼接style编号。"""
+        if self.loadings is None or reference.loadings is None:
+            raise RuntimeError("PCA尚未拟合")
+        if self.features != reference.features:
+            raise ValueError("滚动PCA的因子列不一致")
+        if self.loadings.shape[1] != reference.loadings.shape[1]:
+            raise ValueError("滚动PCA成分数不一致，不能安全对齐")
+        current = self.loadings.astype(np.float64, copy=True)
+        ref = reference.loadings.astype(np.float64, copy=True)
+        current /= np.maximum(np.linalg.norm(current, axis=0, keepdims=True), 1e-12)
+        ref /= np.maximum(np.linalg.norm(ref, axis=0, keepdims=True), 1e-12)
+        similarity = np.abs(ref.T @ current)
+        reference_indices, source_indices = linear_sum_assignment(-similarity)
+        assignment = dict(zip(reference_indices.tolist(), source_indices.tolist()))
+        matches = [assignment[index] for index in range(ref.shape[1])]
+        aligned = self.loadings[:, matches].copy()
+        signs = np.sign(np.sum(ref * aligned, axis=0))
+        signs[signs == 0] = 1.0
+        aligned *= signs
+        self.loadings = aligned
+        self.explained_variance = self.explained_variance[matches]
+        self.rotation = self.rotation[:, matches] * signs
+        normalized_aligned = aligned / np.maximum(
+            np.linalg.norm(aligned, axis=0, keepdims=True), 1e-12)
+        return pd.DataFrame({"new_style": [f"style_{i + 1}" for i in range(len(matches))],
+                             "reference_style": [f"style_{i + 1}" for i in range(len(matches))],
+                             "source_component": [index + 1 for index in matches],
+                             "signed_similarity": [float(np.sum(ref[:, i] * normalized_aligned[:, i]))
+                                                    for i in range(len(matches))]})
 
     @property
     def cumulative_explained_variance(self) -> float:

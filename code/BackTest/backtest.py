@@ -47,24 +47,47 @@ class BacktestEngine:
         if side == "buy" and bool(self.d["st"].at[date, code]):
             return False
         yesterday = prev_close.get(code, np.nan)
-        if np.isfinite(yesterday) and yesterday > 0:
+        if self.cfg.enforce_price_limits and np.isfinite(yesterday) and yesterday > 0:
             limit = .20 if code.startswith(("300", "688")) else .10
             change = twap / yesterday - 1
             if change >= limit - 1e-6 or change <= -limit + 1e-6:
                 return False
         return True
 
+    def _transaction_fee(self, date, side: str, gross: float) -> float:
+        if self.cfg.fee_rate is not None:
+            return gross * self.cfg.fee_rate
+        commission = (max(gross * self.cfg.commission_rate, self.cfg.minimum_commission)
+                      if self.cfg.commission_rate > 0 else 0.0)
+        transfer = gross * self.cfg.transfer_fee_rate
+        stamp = 0.0
+        if side == "SELL":
+            rate = (self.cfg.stamp_duty_rate_from_20230828
+                    if pd.Timestamp(date) >= pd.Timestamp("2023-08-28")
+                    else self.cfg.stamp_duty_rate_before_20230828)
+            stamp = gross * rate
+        return float(commission + transfer + stamp)
+
     def _sell_shares(self, date, code, shares, prev_close):
-        if not self._tradeable(date, code, "sell", prev_close): return False
         p = self.positions[code]
-        if shares < p.shares:
+        current_price = self.actual(
+            self.d["twap"].at[date, code], self.d["adj"].at[date, code])
+        if self._tradeable(date, code, "sell", prev_close):
+            price = current_price
+        elif self.cfg.liquidate_missing_at_last_close and not np.isfinite(current_price):
+            price = self.last_close.get(code, prev_close.get(code, p.avg_cost))
+            if not np.isfinite(price) or price <= 0:
+                return False
+        else:
+            return False
+        if shares < p.shares and not self.cfg.allow_fractional_shares:
             lot = self.lot(code)
             shares = math.floor(shares / lot) * lot
         shares = min(float(shares), p.shares)
         if shares <= 0:
             return False
-        price = self.actual(self.d["twap"].at[date, code], self.d["adj"].at[date, code])
-        gross, fee = shares * price, shares * price * self.cfg.fee_rate
+        gross = shares * price
+        fee = self._transaction_fee(date, "SELL", gross)
         self.cash += gross - fee
         pnl = (price - p.avg_cost) * shares - fee
         self.orders.append([date, code, "SELL", shares, price, fee, gross])
@@ -83,9 +106,25 @@ class BacktestEngine:
         if not self._tradeable(date, code, "buy", prev_close): return False
         price = self.actual(self.d["twap"].at[date, code], self.d["adj"].at[date, code])
         lot = self.lot(code)
-        shares = math.floor(min(budget, self.cash) / (price * (1 + self.cfg.fee_rate)) / lot) * lot
+        available = min(budget, self.cash)
+        variable_rate = (self.cfg.fee_rate if self.cfg.fee_rate is not None
+                         else self.cfg.commission_rate + self.cfg.transfer_fee_rate)
+        if self.cfg.allow_fractional_shares:
+            shares = available / (price * (1 + variable_rate))
+        else:
+            shares = math.floor(available / (price * (1 + variable_rate)) / lot) * lot
         if shares <= 0: return False
-        gross, fee = shares * price, shares * price * self.cfg.fee_rate
+        gross = shares * price
+        fee = self._transaction_fee(date, "BUY", gross)
+        while shares > 0 and gross + fee > available:
+            if self.cfg.allow_fractional_shares:
+                shares *= available / (gross + fee)
+            else:
+                shares -= lot
+            gross = shares * price
+            fee = self._transaction_fee(date, "BUY", gross) if shares > 0 else 0.0
+        if shares <= 0:
+            return False
         self.cash -= gross + fee
         unit_cost = price + fee / shares
         if code in self.positions:
@@ -121,6 +160,27 @@ class BacktestEngine:
             if shortage >= price * self.lot(code):
                 self._buy(date, code, shortage, prev_close)
 
+    def _allocation_weights(self, scores, codes):
+        codes = list(codes)
+        if not codes:
+            return {}
+        if getattr(self.cfg, "weight_mode", "equal") == "equal":
+            value = 1.0 / len(codes)
+            return {code: value for code in codes}
+        values = pd.to_numeric(scores.reindex(codes), errors="coerce")
+        # Model outputs are ranking signals, not calibrated expected returns.
+        # Weight by cross-sectional score rank so a single scale outlier cannot
+        # absorb most of the portfolio while higher scores still receive more.
+        values = values.rank(method="average", pct=True).fillna(0.0)
+        total = float(values.sum())
+        if not np.isfinite(total) or total <= 1e-12:
+            value = 1.0 / len(codes)
+            return {code: value for code in codes}
+        # Keep every selected stock investable while letting the model score tilt size.
+        score_weight = values / total
+        base_weight = 0.20 / len(codes)
+        return {code: float(base_weight + 0.80 * score_weight.loc[code]) for code in codes}
+
     def _corporate_actions(self, date, prev_date):
         for code, p in self.positions.items():
             old, new = self.d["adj"].at[prev_date, code], self.d["adj"].at[date, code]
@@ -133,6 +193,23 @@ class BacktestEngine:
 
     def _close_prices(self, date) -> pd.Series:
         return self.d["close"].loc[date] / self.d["adj"].loc[date]
+
+    def _scheduled_rebalance(self, position: int, dates: pd.DatetimeIndex) -> bool:
+        frequency = self.cfg.rebalance_frequency
+        if frequency == "daily":
+            return True
+        if frequency == "alternate":
+            return (position - 1) % 2 == 0
+        if position == 1:
+            return True
+        current, previous = pd.Timestamp(dates[position]), pd.Timestamp(dates[position - 1])
+        if frequency == "weekly":
+            return current.to_period("W") != previous.to_period("W")
+        if frequency == "monthly":
+            return current.to_period("M") != previous.to_period("M")
+        if frequency == "quarterly":
+            return current.to_period("Q") != previous.to_period("Q")
+        raise ValueError(f"不支持的调仓频率：{frequency}")
 
     def run(self):
         dates = self.d["twap"].index
@@ -153,6 +230,11 @@ class BacktestEngine:
             scores = self.d["factor"].loc[prev_date].replace([np.inf, -np.inf], np.nan)
             in_pool = self.d["pool"].loc[prev_date].fillna(False).astype(bool)
             ranked = scores[in_pool & scores.notna()].sort_values(ascending=False)
+            if self.cfg.selection_mode == "top_quantile":
+                desired_count = max(1, int(math.ceil(len(ranked) * self.cfg.rotation_quantile)))
+            else:
+                desired_count = self.cfg.holding_count
+            desired_codes = ranked.index[:desired_count]
             previous_total = float(self.daily[-1][3])
             self.peak_asset = max(self.peak_asset, previous_total)
             current_drawdown = previous_total / self.peak_asset - 1 if self.peak_asset > 0 else 0.0
@@ -160,7 +242,13 @@ class BacktestEngine:
                               if "trade_enabled" in self.d else True)
             drawdown_enabled = (self.cfg.max_drawdown_limit is None or
                                 current_drawdown > -self.cfg.max_drawdown_limit)
-            rebalance_enabled = signal_enabled and drawdown_enabled
+            # A calendar schedule is only a permission to trade. Sparse monthly
+            # factors must never trigger a liquidation on a day without a new
+            # signal merely because that day matches the selected schedule.
+            signal_available = bool(scores.notna().any())
+            scheduled_rebalance = self._scheduled_rebalance(i, dates) and signal_available
+            trade_gate_enabled = signal_enabled and drawdown_enabled
+            rebalance_enabled = trade_gate_enabled and scheduled_rebalance
             risk_off = (bool(self.d["risk_off"].get(prev_date, False))
                         if "risk_off" in self.d else False)
             qp_optimizer = self.d.get("drawdown_optimizer")
@@ -182,7 +270,26 @@ class BacktestEngine:
             if not rebalance_enabled:
                 target = []
             elif not self.positions:
-                target = [c for c in ranked.index if self._tradeable(date, c, "buy", prev_close)][:self.cfg.holding_count]
+                target = [c for c in desired_codes if self._tradeable(date, c, "buy", prev_close)]
+            elif self.cfg.selection_mode == "top_quantile":
+                # Diagnostic decile portfolio: fully rebuild the book so prior
+                # weights and turnover caps cannot contaminate ranking quality.
+                for code in list(self.positions):
+                    self._sell(date, code, prev_close)
+                target = [c for c in desired_codes if c not in self.positions and self._tradeable(
+                    date, c, "buy", prev_close)]
+            elif self.cfg.selection_mode == "decile_rotation":
+                held_rank = scores.reindex(self.positions).fillna(-np.inf).sort_values()
+                replacement_count = min(
+                    self.cfg.max_replacements,
+                    max(1, int(math.ceil(len(self.positions) * self.cfg.rotation_quantile))))
+                sold = 0
+                for code in held_rank.index[:replacement_count]:
+                    sold += int(self._sell(date, code, prev_close))
+                candidate_count = int(math.ceil(len(ranked) * self.cfg.rotation_quantile))
+                missing = max(0, self.cfg.holding_count - len(self.positions))
+                target = [c for c in ranked.index[:candidate_count]
+                          if c not in self.positions and self._tradeable(date, c, "buy", prev_close)][:missing]
             else:
                 held_rank = scores.reindex(self.positions).fillna(-np.inf).sort_values()
                 retain = (self.d["retain"].loc[prev_date].reindex(self.positions).fillna(False).astype(bool)
@@ -193,7 +300,11 @@ class BacktestEngine:
                 for code in sell_candidates:
                     if sold >= self.cfg.max_replacements: break
                     sold += int(self._sell(date, code, prev_close))
-                target = [c for c in ranked.index if c not in self.positions and self._tradeable(date, c, "buy", prev_close)][:sold]
+                # Refill every missing slot. Using only ``sold`` here lets
+                # delisted/suspended names permanently shrink the portfolio.
+                missing = max(0, self.cfg.holding_count - len(self.positions))
+                target = [c for c in ranked.index if c not in self.positions and self._tradeable(
+                    date, c, "buy", prev_close)][:missing]
 
             close_now = self._close_prices(date)
             valuation_prices = {}
@@ -218,9 +329,27 @@ class BacktestEngine:
                     position.shares * valuation_prices.get(code, position.avg_cost)
                     for code, position in self.positions.items())
             self.target_exposure = target_exposure
-            slots = max(self.cfg.holding_count, 1)
-            for code in target:
-                self._buy(date, code, equity_before * target_exposure / slots, prev_close)
+            allocation = self._allocation_weights(scores, desired_codes)
+            if self.cfg.selection_mode == "top_quantile" and target:
+                # Unsellable stale positions can lock part of the equity. Spread
+                # the remaining deployable cash across every executable target;
+                # otherwise rank-order iteration spends it on the first names and
+                # silently drops the rest of the requested quantile portfolio.
+                held_value = sum(
+                    position.shares * valuation_prices.get(code, position.avg_cost)
+                    for code, position in self.positions.items())
+                deployable = min(self.cash, max(
+                    0.0, equity_before * target_exposure - held_value))
+                target_weight = sum(allocation.get(code, 0.0) for code in target)
+                for code in target:
+                    relative_weight = (allocation.get(code, 0.0) / target_weight
+                                       if target_weight > 1e-12 else 1.0 / len(target))
+                    self._buy(date, code, deployable * relative_weight, prev_close)
+            else:
+                for code in target:
+                    budget = equity_before * target_exposure * allocation.get(
+                        code, 1.0 / max(self.cfg.holding_count, 1))
+                    self._buy(date, code, budget, prev_close)
 
             stock_value = 0.0
             today_holdings = []
@@ -240,7 +369,7 @@ class BacktestEngine:
             actual_exposure = stock_value / total if total > 0 else 0.0
             self.risk_events.append([
                 date, signal_enabled, current_drawdown, drawdown_enabled,
-                rebalance_enabled, risk_off, target_exposure, actual_exposure,
+                scheduled_rebalance, trade_gate_enabled, risk_off, target_exposure, actual_exposure,
                 qp_decision["unconstrained_exposure"],
                 qp_decision["qp_status"], qp_decision["qp_observations"],
                 qp_decision["trailing_mean"], qp_decision["downside_second_moment"],
@@ -262,7 +391,8 @@ class BacktestResult:
         self.trades = pd.DataFrame(e.closed, columns=["code", "buy_date", "sell_date", "buy_price", "sell_price", "shares", "pnl", "holding_days"])
         self.holdings = pd.DataFrame(e.holdings, columns=["date", "code", "shares", "close", "market_value", "avg_cost"])
         self.risk_events = pd.DataFrame(e.risk_events, columns=[
-            "date", "signal_enabled", "prior_drawdown", "drawdown_enabled", "trade_enabled",
+            "date", "signal_enabled", "prior_drawdown", "drawdown_enabled",
+            "scheduled_rebalance", "trade_enabled",
             "risk_off", "target_exposure", "actual_exposure", "unconstrained_exposure",
             "qp_status", "qp_observations", "trailing_mean", "downside_second_moment",
             "risk_multiplier"])

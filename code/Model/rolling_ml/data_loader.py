@@ -1,5 +1,10 @@
 from imports import *
-from env import ADJ_FACTOR_PATH, CALENDAR_PATH, FACTOR_PATH, FEATURE_FORBIDDEN_PATTERNS, TWAP_PATH
+from env import (ADJ_CLOSE_MARKET_PATH, ADJ_FACTOR_PATH, CALENDAR_PATH, FACTOR_PATH,
+                 BACKTEST_DIR, FEATURE_EXCLUDED_COLUMNS, FEATURE_FORBIDDEN_PATTERNS, TWAP_PATH)
+import pyarrow.parquet as pq
+
+if str(BACKTEST_DIR) not in sys.path:
+    sys.path.insert(0, str(BACKTEST_DIR))
 
 
 @dataclass
@@ -14,14 +19,35 @@ class ExistingDataAdapter:
     """只读适配现有数据，不修改价格、票池或回测业务逻辑。"""
 
     def __init__(self, factor_path=FACTOR_PATH, twap_path=TWAP_PATH,
-                 adj_path=ADJ_FACTOR_PATH, calendar_path=CALENDAR_PATH):
+                 adj_path=ADJ_FACTOR_PATH, calendar_path=CALENDAR_PATH,
+                 selected_features: list[str] | tuple[str, ...] | None = None):
         self.factor_path, self.twap_path = Path(factor_path), Path(twap_path)
         self.adj_path, self.calendar_path = Path(adj_path), Path(calendar_path)
+        self.selected_features = tuple(dict.fromkeys(selected_features or ()))
+
+    @staticmethod
+    def _all_market_prices(start: str | None, end: str | None) -> pd.DataFrame:
+        filters = []
+        if start:
+            filters.append(("TradingDate", ">=", pd.Timestamp(start)))
+        if end:
+            filters.append(("TradingDate", "<=", pd.Timestamp(end) + pd.Timedelta(days=10)))
+        raw = pd.read_parquet(ADJ_CLOSE_MARKET_PATH, filters=filters or None)
+        raw["TradingDate"] = pd.to_datetime(raw["TradingDate"])
+        raw["Stkcd"] = raw["Stkcd"].astype(str).str.replace(
+            r"\.0$", "", regex=True).str.zfill(6)
+        return raw.pivot_table(index="TradingDate", columns="Stkcd", values="price",
+                               aggfunc="last").sort_index().astype("float32")
 
     @staticmethod
     def _dates(values) -> pd.DatetimeIndex:
         text = pd.Index(values).astype(str).str.replace(r"\.0$", "", regex=True)
-        return pd.to_datetime(text, format="%Y%m%d", errors="coerce")
+        parsed = pd.to_datetime(text, format="%Y%m%d", errors="coerce")
+        missing = parsed.isna()
+        if missing.any():
+            parsed = pd.DatetimeIndex(parsed)
+            parsed = parsed.where(~missing, pd.to_datetime(text, errors="coerce"))
+        return pd.DatetimeIndex(parsed)
 
     @staticmethod
     def prepare_missing_factors(frame: pd.DataFrame, features: list[str]) -> tuple[pd.DataFrame, dict[str, int]]:
@@ -49,22 +75,44 @@ class ExistingDataAdapter:
                      "partial_factor_missing_rows_kept": int(partial_rows.sum()),
                      "partial_factor_missing_cells_preserved": int(out[features].isna().sum().sum())}
 
-    def load(self, start: str | None = None, end: str | None = None) -> MLDataBundle:
+    def load(self, start: str | None = None, end: str | None = None,
+             all_market: bool = False) -> MLDataBundle:
         for path in (self.factor_path, self.twap_path, self.adj_path, self.calendar_path):
             if not path.exists():
                 raise FileNotFoundError(f"缺少数据文件：{path}")
-        filters = []
-        if start: filters.append(("date", ">=", int(pd.Timestamp(start).strftime("%Y%m%d"))))
-        if end: filters.append(("date", "<=", int(pd.Timestamp(end).strftime("%Y%m%d"))))
-        factors = pd.read_parquet(self.factor_path, filters=filters or None).reset_index()
+        if self.factor_path.suffix.lower() == ".csv":
+            factors = pd.read_csv(self.factor_path)
+        else:
+            columns = set(pq.ParquetFile(self.factor_path).schema_arrow.names)
+            if {"date", "ticker"}.issubset(columns):
+                date_column, lower, upper = "date", (
+                    int(pd.Timestamp(start).strftime("%Y%m%d")) if start else None), (
+                    int(pd.Timestamp(end).strftime("%Y%m%d")) if end else None)
+            elif {"TradingDate", "Stkcd"}.issubset(columns):
+                date_column = "TradingDate"
+                lower = pd.Timestamp(start) if start else None
+                upper = pd.Timestamp(end) if end else None
+            else:
+                raise ValueError("因子数据必须包含 ticker、date 或 Stkcd、TradingDate")
+            filters = []
+            if lower is not None: filters.append((date_column, ">=", lower))
+            if upper is not None: filters.append((date_column, "<=", upper))
+            factors = pd.read_parquet(self.factor_path, filters=filters or None).reset_index()
+        factors = factors.rename(columns={"TradingDate": "date", "Stkcd": "ticker"})
         if not {"ticker", "date"}.issubset(factors.columns):
-            raise ValueError("因子数据必须包含 ticker、date 索引或字段")
+            raise ValueError("因子数据必须包含 ticker、date 或 Stkcd、TradingDate")
         factors["symbol"] = factors.pop("ticker").astype(str).str.replace(r"\.0$", "", regex=True).str.zfill(6)
         factors["factor_date"] = self._dates(factors.pop("date"))
         factors = factors.dropna(subset=["factor_date", "symbol"])
         if factors.duplicated(["factor_date", "symbol"]).any():
             raise ValueError("因子数据存在重复的日期和股票组合")
         original_features = self.feature_columns(factors)
+        if self.selected_features:
+            missing = [name for name in self.selected_features if name not in original_features]
+            if missing:
+                raise ValueError(f"所选因子不在当前因子文件中：{missing}")
+            factors = factors[["factor_date", "symbol", *self.selected_features]].copy()
+            original_features = list(self.selected_features)
         suspicious = [c for c in original_features if any(token in c.lower() for token in FEATURE_FORBIDDEN_PATTERNS)]
         if suspicious:
             raise ValueError(f"检测到疑似未来信息特征：{suspicious}")
@@ -72,29 +120,41 @@ class ExistingDataAdapter:
         factors, missing_stats = self.prepare_missing_factors(factors, original_features)
         features = self.feature_columns(factors)
 
-        twap = pd.read_parquet(self.twap_path)
-        adj = pd.read_parquet(self.adj_path)
-        twap.index, adj.index = self._dates(twap.index), self._dates(adj.index)
-        twap.columns = twap.columns.astype(str).str.zfill(6)
-        adj.columns = adj.columns.astype(str).str.zfill(6)
-        dates = twap.index.intersection(adj.index)
-        symbols = twap.columns.intersection(adj.columns)
-        twap, adj = twap.reindex(index=dates, columns=symbols), adj.reindex(index=dates, columns=symbols)
-        real_twap = twap.div(adj.where(adj > 0)).astype("float32")
+        if all_market:
+            real_twap = self._all_market_prices(start, end)
+            symbols = real_twap.columns
+        else:
+            twap = pd.read_parquet(self.twap_path)
+            adj = pd.read_parquet(self.adj_path)
+            twap.index, adj.index = self._dates(twap.index), self._dates(adj.index)
+            twap.columns = twap.columns.astype(str).str.zfill(6)
+            adj.columns = adj.columns.astype(str).str.zfill(6)
+            dates = twap.index.intersection(adj.index)
+            symbols = twap.columns.intersection(adj.columns)
+            twap, adj = twap.reindex(index=dates, columns=symbols), adj.reindex(index=dates, columns=symbols)
+            real_twap = twap.div(adj.where(adj > 0)).astype("float32")
 
-        raw_calendar = pd.read_csv(self.calendar_path)
-        if not {"calendarDate", "isOpen"}.issubset(raw_calendar.columns):
-            raise ValueError("calendar.csv 必须包含 calendarDate 和 isOpen")
-        open_mask = raw_calendar["isOpen"].astype(str).str.lower().isin({"1", "true", "t", "yes"})
-        calendar = pd.DatetimeIndex(pd.to_datetime(raw_calendar.loc[open_mask, "calendarDate"])).sort_values().unique()
-        common = calendar.intersection(real_twap.index)
+        if all_market:
+            previous = real_twap.shift()
+            same = real_twap.eq(previous) | (real_twap.isna() & previous.isna())
+            changed = ~same.all(axis=1)
+            changed.iloc[0] = True
+            common = pd.DatetimeIndex(real_twap.index[changed.fillna(False)])
+        else:
+            raw_calendar = pd.read_csv(self.calendar_path)
+            if not {"calendarDate", "isOpen"}.issubset(raw_calendar.columns):
+                raise ValueError("calendar.csv must contain calendarDate and isOpen")
+            open_mask = raw_calendar["isOpen"].astype(str).str.lower().isin({"1", "true", "t", "yes"})
+            calendar = pd.DatetimeIndex(pd.to_datetime(
+                raw_calendar.loc[open_mask, "calendarDate"])).sort_values().unique()
+            common = calendar.intersection(real_twap.index)
         real_twap = real_twap.reindex(common)
         if start:
             factors = factors[factors.factor_date >= pd.Timestamp(start)]
             real_twap = real_twap.loc[pd.Timestamp(start):]
         if end:
             factors = factors[factors.factor_date <= pd.Timestamp(end)]
-            # 价格保留 end 之后两个交易日，用于测试期末 t1/t2 标签。
+            # 价格保留 end 之后的下一个交易日，用于测试期末 t0/t1 标签。
 
         factor_dates = pd.DatetimeIndex(factors.factor_date.unique())
         quality = pd.DataFrame([
@@ -112,5 +172,6 @@ class ExistingDataAdapter:
 
     @staticmethod
     def feature_columns(frame: pd.DataFrame) -> list[str]:
-        excluded = {"factor_date", "symbol", "label", "label_entry_date", "label_exit_date"}
+        excluded = {"factor_date", "symbol", "label", "label_entry_date", "label_exit_date",
+                    *FEATURE_EXCLUDED_COLUMNS}
         return [c for c in frame.columns if c not in excluded and pd.api.types.is_numeric_dtype(frame[c])]

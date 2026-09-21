@@ -75,6 +75,18 @@ def test_lazy_holding_is_created_only_by_turnover_optimizer():
     assert audit.loc[0, "max_turnover_ratio"] == .25
 
 
+def test_lazy_turnover_accepts_direct_model_retain_signal():
+    date = pd.Timestamp("2024-01-02")
+    predictions = pd.DataFrame({"factor_date": [date, date],
+                                "symbol": ["000001", "000002"],
+                                "retain": [True, False]})
+    optimizer = LazyTurnoverOptimizer(max_turnover_ratio=.2)
+    retain, audit = optimizer.build_retain(
+        predictions, pd.DatetimeIndex([date]), pd.Index(["000001", "000002"]))
+    assert retain.loc[date].to_dict() == {"000001": True, "000002": False}
+    assert audit.loc[0, "retained_count"] == 1
+
+
 def test_quadratic_drawdown_optimizer_keeps_trading_and_reduces_exposure():
     dates = pd.to_datetime(["2024-01-02", "2024-01-03"])
     predictions = pd.DataFrame({

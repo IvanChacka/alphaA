@@ -13,11 +13,28 @@ class BacktestConfig:
     output_dir: Path = ROOT / "output"
     initial_cash: float = 100_000_000.0
     holding_count: int = 200
+    weight_mode: str = "score"
     max_turnover_ratio: float = 0.30
+    selection_mode: str = "top_n_buffer"
+    rotation_quantile: float = 0.10
+    rebalance_frequency: str = "daily"
     max_drawdown_limit: float | None = None
-    fee_rate: float = 0.0014
+    allow_fractional_shares: bool = False
+    # Price-limit checks require unadjusted executable prices. Research datasets
+    # containing adjusted closes must disable them explicitly.
+    enforce_price_limits: bool = True
+    # Close-only research data cannot distinguish suspension from delisting.
+    # Allow stale positions to leave at their last observed close on rebalance.
+    liquidate_missing_at_last_close: bool = False
+    # Legacy flat per-side override. None uses the direction/date-aware A-share schedule below.
+    fee_rate: float | None = None
+    commission_rate: float = 0.0003
+    transfer_fee_rate: float = 0.00001
+    minimum_commission: float = 5.0
+    stamp_duty_rate_before_20230828: float = 0.001
+    stamp_duty_rate_from_20230828: float = 0.0005
     annual_days: int = 252
-    risk_free_rate: float = 0.0
+    risk_free_rate: float = 0.02
     start_date: str | None = None
     end_date: str | None = None
     market: str = "A500"
@@ -33,6 +50,7 @@ MARKETS = {
     "ZZ1000": ("pool_zz1000.parquet", "Benchmark_zz1000.parquet"),
     "ALL_A500": (None, "Benchmark_A500.parquet"),
     "ALL_ZZ1000": (None, "Benchmark_zz1000.parquet"),
+    "ALL_MARKET": (None, None),
 }
 
 

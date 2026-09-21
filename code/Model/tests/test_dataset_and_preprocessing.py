@@ -3,6 +3,7 @@ from rolling_ml.dataset_builder import DatasetBuilder
 from rolling_ml.data_loader import ExistingDataAdapter
 from rolling_ml.preprocessing import FeaturePreprocessor
 from style_rotation.preprocessing import CrossSectionalPreprocessor
+import rolling_ml.data_loader as data_loader
 
 
 def test_unlabeled_tail_is_kept_for_prediction():
@@ -63,6 +64,36 @@ def test_data_adapter_drops_all_missing_rows_but_preserves_partial_missing():
     assert not any(column.endswith("_missing") for column in result.columns)
     assert stats["all_factor_missing_rows_dropped"] == 1
     assert stats["partial_factor_missing_cells_preserved"] == 2
+
+
+def test_monthly_factor_schema_dates_and_target_are_supported():
+    dates = ExistingDataAdapter._dates(pd.Series([pd.Timestamp("2024-01-31")]))
+    frame = pd.DataFrame({"factor_date": dates, "symbol": ["000001"],
+                          "calc_size": [1.0], "r_shift": [0.05]})
+
+    assert dates[0] == pd.Timestamp("2024-01-31")
+    assert ExistingDataAdapter.feature_columns(frame) == ["calc_size"]
+
+
+def test_data_adapter_filters_to_explicit_selected_features(tmp_path, monkeypatch):
+    factor_path = tmp_path / "factors.parquet"
+    market_path = tmp_path / "market.parquet"
+    placeholder = tmp_path / "placeholder.parquet"
+    calendar = tmp_path / "calendar.csv"
+    pd.DataFrame({"date": [20240102, 20240102], "ticker": ["000001", "000002"],
+                  "alpha_a": [1., 2.], "alpha_b": [3., 4.]}).to_parquet(factor_path)
+    pd.DataFrame({"TradingDate": pd.to_datetime(["2024-01-02", "2024-01-03"]),
+                  "Stkcd": ["000001", "000001"], "price": [10., 11.]}).to_parquet(market_path)
+    pd.DataFrame({"unused": [1]}).to_parquet(placeholder)
+    calendar.write_text("calendarDate,isOpen\n2024-01-02,1\n", encoding="utf-8")
+    monkeypatch.setattr(data_loader, "ADJ_CLOSE_MARKET_PATH", market_path)
+
+    bundle = ExistingDataAdapter(
+        factor_path, placeholder, placeholder, calendar,
+        selected_features=["alpha_b"]).load("2024-01-02", "2024-01-02", all_market=True)
+
+    assert ExistingDataAdapter.feature_columns(bundle.factors) == ["alpha_b"]
+    assert "alpha_a" not in bundle.factors
 
 
 def test_style_preprocessor_standardizes_daily_observations_before_filling():

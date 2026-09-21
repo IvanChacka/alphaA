@@ -13,3 +13,6 @@ code/BackTest/output/
 # 本机完整因子文件超过GitHub单文件限制，仓库仅保留数据接口说明。
 BackTestData/factordata.parquet
 BackTestData/twap.parquet
+
+# 本地因子、行情、股票池和交易日历数据不提交到仓库
+BackTestData/*

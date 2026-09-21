@@ -1,4 +1,4 @@
-"""季度滚动机器学习总入口。"""
+"""按调仓频率滚动的机器学习总入口。"""
 from imports import *
 from env import (ACTIVE_POOLS, DRAWDOWN_LIMIT, DRAWDOWN_OPTIMIZER_NAMES,
                  LINEAR_MODELS, MODEL_N_JOBS, NONLINEAR_MODELS, MLConfig,
@@ -14,11 +14,29 @@ from rolling_ml.rolling_predict import RollingPredictor
 def parse_args():
     parser = argparse.ArgumentParser(description="季度滚动机器学习预测")
     parser.add_argument("--test-year", type=int, default=2024)
+    parser.add_argument("--train-start", default=None)
+    parser.add_argument("--train-end", default=None)
+    parser.add_argument("--test-start", default=None)
+    parser.add_argument("--test-end", default=None)
+    parser.add_argument("--factor-path", default=None)
+    parser.add_argument("--features", nargs="+", default=None,
+                        help="仅使用指定的因子字段")
     parser.add_argument("--pools", nargs="+", default=ACTIVE_POOLS)
     parser.add_argument("--models", nargs="+", default=LINEAR_MODELS + NONLINEAR_MODELS)
     parser.add_argument("--optuna-trials", type=int, default=OPTUNA_N_TRIALS)
     parser.add_argument("--n-jobs", type=int, default=MODEL_N_JOBS)
     parser.add_argument("--window-mode", choices=["expanding", "fixed"], default="expanding")
+    parser.add_argument("--train-years", type=int, default=4)
+    parser.add_argument("--retune-each-year", action="store_true",
+                        help="每年按当时的实际训练窗口重新选择超参数")
+    parser.add_argument("--holding-count", type=int, default=200)
+    parser.add_argument("--selection-mode", choices=["top_quantile", "top_n_buffer"], default="top_quantile")
+    parser.add_argument("--selection-quantile", type=float, default=.10)
+    parser.add_argument("--rebalance-frequency", choices=["daily", "alternate", "weekly", "monthly", "quarterly"], default="daily")
+    parser.add_argument("--weight-mode", choices=["score", "equal"], default="score")
+    parser.add_argument("--include-costs", action="store_true")
+    parser.add_argument("--commission-rate", type=float, default=.0003)
+    parser.add_argument("--stamp-duty-rate", type=float, default=.0005)
     parser.add_argument("--skip-backtest", action="store_true")
     parser.add_argument("--optimizer", choices=OPTIMIZER_NAMES, default="none",
                         help="预测分数进入既有回测前使用的约束优化器")
@@ -37,9 +55,19 @@ def _read_optional(path: Path) -> pd.DataFrame:
 
 def main() -> None:
     args = parse_args()
+    if not 0 < args.selection_quantile <= 1:
+        raise ValueError("选股分位必须在0到1之间")
     cfg = MLConfig(models=tuple(args.models), pools=tuple(args.pools), optuna_trials=args.optuna_trials,
                    n_jobs=args.n_jobs, window_mode=args.window_mode,
-                   test_start=f"{args.test_year}-01-01", test_end=f"{args.test_year}-12-31")
+                   train_years=args.train_years,
+                   train_start=args.train_start or MLConfig().train_start,
+                   initial_train_end=args.train_end or MLConfig().initial_train_end,
+                   test_start=args.test_start or f"{args.test_year}-01-01",
+                   test_end=args.test_end or f"{args.test_year}-12-31",
+                   factor_path=args.factor_path or MLConfig().factor_path,
+                   selected_features=tuple(args.features or ()),
+                   rebalance_frequency=args.rebalance_frequency,
+                   retune_each_year=args.retune_each_year)
     logger = ExperimentLogger(cfg.output_root, args.resume_run)
     try:
         if not args.skip_backtest:
@@ -65,7 +93,15 @@ def main() -> None:
                             drawdown_optimizer_name=args.drawdown_optimizer,
                             sell_confirmations=args.sell_confirmations,
                             max_turnover_ratio=args.max_turnover_ratio,
-                            max_drawdown_limit=args.max_drawdown_limit)
+                            max_drawdown_limit=args.max_drawdown_limit,
+                            holding_count=args.holding_count,
+                            selection_mode=args.selection_mode,
+                            rotation_quantile=args.selection_quantile,
+                            rebalance_frequency=args.rebalance_frequency,
+                            weight_mode=args.weight_mode,
+                            include_costs=args.include_costs,
+                            commission_rate=args.commission_rate,
+                            stamp_duty_rate=args.stamp_duty_rate)
                         backtest_rows.append({"model": model_name, "pool": pool, **metrics})
                         curve["model"], curve["pool"] = model_name, pool
                         curve_frames.append(curve)
@@ -95,6 +131,10 @@ def main() -> None:
         manifest["optimizer"] = args.optimizer
         manifest["turnover_optimizer"] = args.turnover_optimizer
         manifest["drawdown_optimizer"] = args.drawdown_optimizer
+        manifest["selection_mode"] = args.selection_mode
+        manifest["selection_quantile"] = args.selection_quantile
+        manifest["rebalance_frequency"] = args.rebalance_frequency
+        manifest["weight_mode"] = args.weight_mode
         logger.json("config/run_manifest.json", manifest)
         report = ReportGenerator().generate(logger.root / "report/index.html", logger.run_id,
             {**asdict(cfg), "optimizer": args.optimizer},
